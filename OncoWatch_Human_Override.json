@@ -1,0 +1,550 @@
+{
+  "name": "OncoWatch_Human_Override",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "oncowatch-override",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "90bd0205-7d3c-4cdd-bec2-82e74d71bfd1",
+      "name": "Webhook",
+      "webhookId": "4b658ab6-b8f5-4885-a15f-acdf4678ccc3",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "pgS5hhz3FtHw8ouE",
+          "name": "OncoWatch Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ✅ CORRECT — only 2 lines\nconst raw  = $input.first().json;\nconst body = raw.payload ? JSON.parse(raw.payload) : (raw.body || raw);\n\n// ─── Safe sanitized accessor ──────────────────────────────\nconst safe = (v, fallback = '') => {\n  if (v === null || v === undefined) return fallback;\n  return String(v)\n    .replace(/[\\u0000-\\u001F\\u007F-\\u009F]/g, '')  // strip control chars\n    .replace(/'/g, \"\\\\'\")                            // escape single quotes\n    .trim() || fallback;\n};\n\n// ─── Support Slack interactive payload (button click) ────\nconst isSlackInteractive = !!raw.payload;\nconst slackPayload       = isSlackInteractive ? JSON.parse(raw.payload) : null;\n\n// ─── Extract fields (supports 3 input formats) ────────────\n// Format 1: Direct API call { signal_id, action, user_name, reason }\n// Format 2: Slack slash command { text: \"NCT123 ESCALATE reason here\" }\n// Format 3: Slack button interactive payload\n\nlet signalId, action, overrideBy, slackUserId, slackChannel, reason, newLevel, responseUrl;\n\nif (isSlackInteractive && slackPayload) {\n  // Slack button click\n  const actionData  = slackPayload.actions?.[0] || {};\n  const actionValue = actionData.value || '';\n  const parts       = actionValue.split('|');  // format: \"ESCALATE|NCT123|reason\"\n\n  action       = safe(parts[0] || '').toUpperCase();\n  signalId     = safe(parts[1] || slackPayload.callback_id || '');\n  reason       = safe(parts[2] || 'Triggered via Slack button');\n  newLevel     = safe(parts[3] || '').toUpperCase();\n  overrideBy   = safe(slackPayload.user?.name || slackPayload.user?.username || 'slack_user');\n  slackUserId  = safe(slackPayload.user?.id || '');\n  slackChannel = safe(slackPayload.channel?.name || slackPayload.channel?.id || '#oncowatch-alerts');\n  responseUrl  = safe(slackPayload.response_url || '');\n\n} else if (body.text && !body.action) {\n  // Slack slash command: /override NCT123 ESCALATE reason here\n  const parts  = String(body.text || '').trim().split(/\\s+/);\n  signalId     = safe(parts[0] || '');\n  action       = safe(parts[1] || '').toUpperCase();\n  newLevel     = action === 'RECLASSIFY' ? safe(parts[2] || '').toUpperCase() : '';\n  reason       = action === 'RECLASSIFY'\n    ? safe(parts.slice(3).join(' '))\n    : safe(parts.slice(2).join(' ') || 'Via Slack slash command');\n  overrideBy   = safe(body.user_name || body.user_id || 'slack_user');\n  slackUserId  = safe(body.user_id || '');\n  slackChannel = safe(body.channel_name || body.channel_id || '#oncowatch-alerts');\n  responseUrl  = safe(body.response_url || '');\n\n} else {\n  // Direct API call\n  signalId     = safe(body.signal_id || body.source_id);\n  action       = safe(body.action || '').toUpperCase();\n  overrideBy   = safe(body.user_name || body.user_id || body.analyst || 'api_user');\n  slackUserId  = safe(body.user_id || '');\n  slackChannel = safe(body.channel_id || body.channel || '#oncowatch-alerts');\n  reason       = safe(body.reason || body.text || body.note || 'No reason provided');\n  newLevel     = safe(body.new_level || body.level || '').toUpperCase();\n  responseUrl  = safe(body.response_url || '');\n}\n\n// ─── Normalise channel name ───────────────────────────────\nif (slackChannel && !slackChannel.startsWith('#') && !slackChannel.startsWith('C')) {\n  slackChannel = `#${slackChannel}`;\n}\n\n// ─── Validation layer ─────────────────────────────────────\nconst errors = [];\n\nif (!signalId)  errors.push('Missing signal_id / source_id');\nif (!action)    errors.push('Missing action');\nif (!overrideBy || overrideBy === 'api_user' && !body.user_name) {\n  overrideBy = 'system';\n}\n\nconst VALID_ACTIONS = ['APPROVE', 'ESCALATE', 'DISMISS', 'RECLASSIFY'];\nif (action && !VALID_ACTIONS.includes(action)) {\n  errors.push(`Invalid action: \"${action}\". Valid: ${VALID_ACTIONS.join(', ')}`);\n}\n\nconst VALID_LEVELS = ['HIGH', 'MED', 'LOW'];\nif (action === 'RECLASSIFY' && !VALID_LEVELS.includes(newLevel)) {\n  errors.push(`RECLASSIFY requires new_level: HIGH, MED, or LOW. Got: \"${newLevel}\"`);\n}\n\nif (errors.length > 0) {\n  throw new Error(`Override validation failed:\\n${errors.map(e => `• ${e}`).join('\\n')}`);\n}\n\n// ─── Priority map ─────────────────────────────────────────\nconst PRIORITY = { ESCALATE: 1, RECLASSIFY: 2, APPROVE: 3, DISMISS: 4 };\n\n// ─── Action metadata ──────────────────────────────────────\nconst ACTION_META = {\n  APPROVE:    { emoji: '✅', label: 'Approved',     color: '#36A64F', priority: PRIORITY.APPROVE   },\n  ESCALATE:   { emoji: '🔴', label: 'Escalated',    color: '#FF0000', priority: PRIORITY.ESCALATE  },\n  DISMISS:    { emoji: '🚫', label: 'Dismissed',    color: '#888888', priority: PRIORITY.DISMISS   },\n  RECLASSIFY: { emoji: '🔄', label: 'Reclassified', color: '#FFB300', priority: PRIORITY.RECLASSIFY}\n};\n\nconst meta = ACTION_META[action];\n\n// ─── Build override fingerprint (for deduplication) ──────\nconst overrideId = `${signalId}_${action}_${Date.now()}`;\n\n// ─── Urgency flag ─────────────────────────────────────────\nconst isUrgentAction = action === 'ESCALATE';\n\nreturn [{\n  json: {\n    // Core override fields\n    overrideId,\n    signalId,\n    action,\n    overrideBy,\n    slackUserId,\n    slackChannel,\n    reason,\n    newLevel,\n    responseUrl,\n\n    // Action metadata\n    actionEmoji:    meta.emoji,\n    actionLabel:    meta.label,\n    actionColor:    meta.color,\n    actionPriority: meta.priority,\n    isUrgentAction,\n\n    // Source tracking\n    inputFormat:    isSlackInteractive ? 'slack_button' : body.text && !body.action ? 'slack_slash' : 'direct_api',\n    receivedAt:     new Date().toISOString(),\n    requestId:      `OVR-${Date.now()}`\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        0
+      ],
+      "id": "2228f227-4054-48bf-a478-e6022c86e3b0",
+      "name": "Parse Override Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const override = $('Parse Override Request').first().json;\nconst signal   = $('Validate Signal').first().json;\n\n// ─── Signal existence check ───────────────────────────────\nif (!signal || !signal.source_id) {\n  throw new Error(\n    `[OncoWatch Override] Signal not found in database.\\n` +\n    `Signal ID: ${override.signalId}\\n` +\n    `Requested by: ${override.overrideBy}\\n` +\n    `Action: ${override.action}\\n` +\n    `Hint: Verify source_id exists in signals table.`\n  );\n}\n\n// ─── Block double-override guard ──────────────────────────\nconst BLOCKED_REOVERRIDE = ['dismissed'];\nif (BLOCKED_REOVERRIDE.includes(signal.override_status)) {\n  throw new Error(\n    `[OncoWatch Override] Signal ${override.signalId} is already \"${signal.override_status}\" ` +\n    `and cannot be overridden again. Contact admin to reset.`\n  );\n}\n\n// ─── Advanced scoring engine for RECLASSIFY ──────────────\nconst BASE_SCORES   = { HIGH: 7.0, MED: 4.0, LOW: 1.0 };\nconst COMPETITOR_BONUS = signal.competitor_flag ? 2.0 : 0;\nconst ESCALATE_FLOOR   = 8.5;  // escalated signals minimum score\n\nfunction computeNewScore(action, newLevel, currentScore, isCompetitor) {\n  const base = BASE_SCORES[newLevel] || parseFloat(currentScore) || 0;\n  const competitorBonus = isCompetitor ? 2.0 : 0;\n\n  switch (action) {\n    case 'ESCALATE':\n      // Always bring score to at least ESCALATE_FLOOR\n      return Math.max(\n        parseFloat(currentScore) + 1.5,\n        ESCALATE_FLOOR\n      );\n\n    case 'RECLASSIFY':\n      // Base + competitor bonus, capped at 10\n      return Math.min(base + competitorBonus, 10.0);\n\n    case 'APPROVE':\n      // Slight score boost for approved signals\n      return Math.min(parseFloat(currentScore) + 0.3, 10.0);\n\n    case 'DISMISS':\n      // Score zeroed out for dismissed signals\n      return 0.0;\n\n    default:\n      return parseFloat(currentScore) || 0;\n  }\n}\n\nconst newScore = parseFloat(\n  computeNewScore(\n    override.action,\n    override.newLevel,\n    signal.impact_score,\n    signal.competitor_flag\n  ).toFixed(2)\n);\n\n// ─── Determine final impact level ────────────────────────\nconst finalLevel = (() => {\n  if (override.action === 'RECLASSIFY') return override.newLevel;\n  if (override.action === 'ESCALATE')   return 'HIGH';\n  if (override.action === 'DISMISS')    return signal.impact_level; // preserve original\n  return signal.impact_level;\n})();\n\n// ─── Urgency flag logic ───────────────────────────────────\nconst isUrgentAfterOverride = (\n  override.action === 'ESCALATE' ||\n  (finalLevel === 'HIGH' && signal.competitor_flag) ||\n  newScore >= 8.5\n);\n\n// ─── Override status map ──────────────────────────────────\nconst OVERRIDE_STATUS_MAP = {\n  APPROVE:    'approved',\n  ESCALATE:   'escalated',\n  DISMISS:    'dismissed',\n  RECLASSIFY: 'reclassified'\n};\n\n// ─── Score delta display ──────────────────────────────────\nconst prevScore    = parseFloat(signal.impact_score) || 0;\nconst scoreDelta   = parseFloat((newScore - prevScore).toFixed(2));\nconst scoreDeltaStr = scoreDelta > 0\n  ? `+${scoreDelta}`\n  : String(scoreDelta);\n\n// ─── Level change detection ───────────────────────────────\nconst levelChanged   = finalLevel !== signal.impact_level;\nconst levelChangeStr = levelChanged\n  ? `${signal.impact_level} → ${finalLevel}`\n  : `${signal.impact_level} (unchanged)`;\n\n// ─── Score breakdown audit ────────────────────────────────\nconst overrideScoreBreakdown = JSON.stringify({\n  action:           override.action,\n  previousLevel:    signal.impact_level,\n  finalLevel,\n  previousScore:    prevScore,\n  newScore,\n  scoreDelta,\n  competitorBonus:  COMPETITOR_BONUS,\n  isUrgent:         isUrgentAfterOverride,\n  overrideBy:       override.overrideBy,\n  overrideId:       override.overrideId || `OVR-${Date.now()}`,\n  scoringVersion:   1\n});\n\n// ─── Slack confirmation summary ───────────────────────────\nconst summaryLine =\n  `${override.actionEmoji} *${override.actionLabel}* by ${override.overrideBy} ` +\n  `| ${signal.key_drug || signal.drug_name} (${signal.key_indication}) ` +\n  `| Score: ${prevScore} → ${newScore} (${scoreDeltaStr}) ` +\n  `| Level: ${levelChangeStr}`;\n\nreturn [{\n  json: {\n    // ── Override metadata ──────────────────────────────\n    ...override,\n    overrideStatus:        OVERRIDE_STATUS_MAP[override.action],\n    isUrgentAfterOverride,\n    overrideScoreBreakdown,\n\n    // ── Signal original data ───────────────────────────\n    drug:            signal.key_drug || signal.drug_name   || 'Unknown',\n    indication:      signal.key_indication                 || 'Unknown',\n    sponsor:         signal.sponsor                        || 'Unknown',\n    signalType:      signal.signal_type                    || 'unknown',\n    isCompetitor:    signal.competitor_flag                || false,\n    aiSummary:       signal.ai_summary                     || 'No summary',\n    url:             signal.url                            || '',\n    previousLevel:   signal.impact_level,\n    previousScore:   prevScore,\n    currentOverride: signal.override_status               || 'none',\n\n    // ── Computed fields ────────────────────────────────\n    finalLevel,\n    newScore,\n    scoreDelta,\n    scoreDeltaStr,\n    levelChanged,\n    levelChangeStr,\n    summaryLine,\n\n    // ── Timestamps ────────────────────────────────────\n    processedAt: new Date().toISOString()\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        0
+      ],
+      "id": "ec2dcc77-61da-4fd5-9916-57ca776e6443",
+      "name": "Merge Override Context"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO signal_overrides (\n  signal_id,\n  override_action,\n  override_by,\n  override_reason,\n  previous_level,\n  new_impact_level,\n  previous_score,\n  new_score,\n  slack_channel,\n  slack_user_id,\n  created_at\n) VALUES (\n  '{{ $json.signalId }}',\n  '{{ $json.action }}',\n  '{{ $json.overrideBy }}',\n  '{{ $json.reason }}',\n  '{{ $json.previousLevel }}',\n  '{{ $json.finalLevel }}',\n  {{ $json.previousScore }},\n  {{ $json.newScore }},\n  '{{ $json.slackChannel }}',\n  '{{ $json.slackUserId }}',\n  NOW()\n);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        832,
+        -176
+      ],
+      "id": "9829e073-9f8a-4b72-be93-bd678baa422c",
+      "name": "Log Override Audit",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "APPROVE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "ba6c46c3-c4db-47e6-8203-4e21909ba952"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "be908e6e-0f5e-42d1-9f8a-99d130b0baee",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "ESCALATE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a625a1d4-136f-4bad-b5f0-c9e2dc19506e",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "DISMISS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "cbd98b45-4183-4843-85a2-a3b6ebf3fa27",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "RECLASSIFY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1008,
+        176
+      ],
+      "id": "bb500f2d-da11-4259-8ee1-1e50db45d051",
+      "name": "Route by Action"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET\n  override_status = 'approved',\n  override_by     = '{{ $json.overrideBy }}',\n  override_reason = '{{ ($json.reason || '').replace(/'/g, \"''\") }}',\n  override_at     = NOW()\nWHERE source_id = '{{ $json.signalId }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1248,
+        -176
+      ],
+      "id": "86172056-f2a5-4b63-af9f-d2f58cbe75fe",
+      "name": "Update Signal: Approved",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET\n  impact_level    = 'HIGH',\n  impact_score    = GREATEST(impact_score, 8.5),\n  is_urgent       = true,\n  override_status = 'escalated',\n  override_by     = '{{ $json.overrideBy }}',\n  override_reason = '{{ ($json.reason || '').replace(/'/g, \"''\") }}',\n  override_at     = NOW()\nWHERE source_id = '{{ $json.signalId }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1296,
+        -48
+      ],
+      "id": "9f8c23e8-22a0-4e9a-a790-8aaa9ac43558",
+      "name": "Update Signal: Escalated",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET\n  override_status = 'dismissed',\n  override_by     = '{{ $json.overrideBy }}',\n  override_reason = '{{ ($json.reason || '').replace(/'/g, \"''\") }}',\n  override_at     = NOW(),\n  is_urgent       = false\nWHERE source_id = '{{ $json.signalId }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1248,
+        96
+      ],
+      "id": "a0b00daf-51d7-470d-b892-d70de74bed45",
+      "name": "Update Signal: Dismissed",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET\n  impact_level    = '{{ $json.newLevel }}',\n  impact_score    = {{ $json.newScore }},\n  override_status = 'reclassified',\n  override_by     = '{{ $json.overrideBy }}',\n  override_reason = '{{ ($json.reason || '').replace(/'/g, \"''\") }}',\n  override_at     = NOW()\nWHERE source_id = '{{ $json.signalId }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1280,
+        288
+      ],
+      "id": "4db38cd4-1643-4a1c-a7b8-7c30af7ef483",
+      "name": "Update Signal: Reclassified",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1584,
+        0
+      ],
+      "id": "a9a687f5-9a94-44fd-a7d7-61ae704f2ce8",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-alerts",
+          "mode": "name"
+        },
+        "text": "={{ $json.actionEmoji }} OncoWatch Human Override  • Signal ID: {{ $json.signalId }} • Action: {{ $json.actionLabel }} ({{ $json.action }}) • Drug: {{ $json.drug }} • Indication: {{ $json.indication }} • Previous level: {{ $json.previousLevel }} • New level: {{ $json.finalLevel }} • Previous score: {{ $json.previousScore }} • New score: {{ $json.newScore }} ({{ $json.scoreDeltaStr }}) • Competitor: {{ $json.isCompetitor ? 'Yes' : 'No' }} • Reason: {{ $json.reason }} • Override by: {{ $json.overrideBy }} • Urgent after override: {{ $json.isUrgentAfterOverride ? 'YES' : 'NO' }} • Logged at: {{ $json.processedAt }}",
+        "otherOptions": {
+          "mrkdwn": true,
+          "unfurl_links": false,
+          "unfurl_media": false
+        }
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        1792,
+        304
+      ],
+      "id": "319ab356-ee11-4934-937a-60d18c4ac11b",
+      "name": "Send a message",
+      "webhookId": "06435886-469a-404d-84da-ee96a0330466",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"success\",\n  \"action\": \"{{ $('Webhook').item.json.action }}\",\n  \"signal_id\": \"{{ $('Webhook').item.json.signal_id }}\",\n  \"processed_at\": \"{{ $now }}\"\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2000,
+        0
+      ],
+      "id": "f067148a-291a-4648-90f3-d142bdef6d3a",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  source_id,\n  key_drug,\n  key_indication,\n  sponsor,\n  impact_level,\n  impact_score,\n  signal_type,\n  competitor_flag,\n  ai_summary,\n  override_status,\n  url\nFROM signals\nWHERE source_id = '{{ $json.signalId }}'\nLIMIT 1;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        416,
+        0
+      ],
+      "id": "09f48e8e-3db0-412f-9e91-3484b0802ff5",
+      "name": "Validate Signal",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Override Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Override Request": {
+      "main": [
+        [
+          {
+            "node": "Validate Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Override Context": {
+      "main": [
+        [
+          {
+            "node": "Log Override Audit",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route by Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Override Audit": {
+      "main": [
+        [
+          {
+            "node": "Route by Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Action": {
+      "main": [
+        [
+          {
+            "node": "Update Signal: Approved",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Signal: Escalated",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Signal: Dismissed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Signal: Reclassified",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Signal: Approved": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Signal: Escalated": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Update Signal: Dismissed": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Update Signal: Reclassified": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a message": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Signal": {
+      "main": [
+        [
+          {
+            "node": "Merge Override Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "ce370f2e-e1a8-4657-bfe1-d4e7cc62962f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a8a891a30415836be7de9e961a55fb56810b2ca8a0f8f3007a592ec0e56663ad"
+  },
+  "id": "kyqBIVuj-Nt84PUfS5yNn",
+  "tags": []
+}

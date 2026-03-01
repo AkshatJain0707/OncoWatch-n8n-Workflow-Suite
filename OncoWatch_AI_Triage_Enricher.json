@@ -1,0 +1,1530 @@
+{
+  "name": "OncoWatch_AI_Triage_Enricher",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "2b08854c-825d-433a-b2b8-15a03af6ca17",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH candidates AS (\n  SELECT\n    s.*,\n    -- Priority components\n    CASE\n      WHEN s.is_urgent IS TRUE THEN 3         -- urgent signals first\n      WHEN s.override_status IS NOT NULL\n           AND s.override_status <> 'none' THEN 2  -- human-touched signals next\n      WHEN s.competitor_flag IS TRUE THEN 2   -- competitor trials higher\n      ELSE 1\n    END                                   AS priority_base,\n    COALESCE(s.retry_count, 0)            AS retry_count_safe,\n    EXTRACT(EPOCH FROM (NOW() - COALESCE(s.last_seen_at, s.ingested_at))) / 3600.0 AS age_hours,\n    COALESCE(s.version, 1)                AS version_safe\n  FROM signals s\n  WHERE\n    -- 1) Never processed by AI OR explicitly marked for reprocessing\n    (\n      s.ai_processed IS FALSE\n      OR s.ai_processed IS NULL\n      OR s.version > COALESCE(\n          -- simple “AI version” stored in scoring_version; if signals.version > scoring_version, re-triage\n          s.scoring_version, \n          0\n        )\n    )\n    -- 2) Respect retry limits\n    AND COALESCE(s.retry_count, 0) < 3\n\n    -- 3) Optional: only consider relatively recent or active signals\n    AND COALESCE(s.status, '') NOT IN ('completed','withdrawn','terminated')\n    AND s.ingested_at >= NOW() - INTERVAL '365 days'\n)\nSELECT *\nFROM candidates\n-- Advanced prioritization:\nORDER BY\n  priority_base DESC,               -- urgent & overridden & competitor first\n  is_urgent DESC NULLS LAST,\n  competitor_flag DESC NULLS LAST,\n  COALESCE(impact_level, 'LOW') ASC, -- unknown/low first for triage\n  age_hours DESC,                    -- older ones first within same band\n  retry_count_safe ASC               -- fewer retries first\nLIMIT 50;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "a5601103-31ee-4b3d-8d5e-f6c7fede86d9",
+      "name": "Fetch Signals Needing AI",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ============================================================\n * OncoWatch CI Triage — Build AI Input\n * Version: 3.0.0\n * Stage: Production\n * ============================================================\n * Responsibilities:\n *  1. Normalize and validate raw signal fields\n *  2. Assess pre-LLM signal quality & route to correct model\n *  3. Build structured features object\n *  4. Compress and sanitize context text\n *  5. Construct system + user prompts (override-aware)\n *  6. Emit final OpenRouter body + full enriched item\n * ============================================================\n */\n\n// ─────────────────────────────────────────────\n// 0. CONSTANTS\n// ─────────────────────────────────────────────\nconst PIPELINE_VERSION    = '3.0.0';\nconst MAX_CONTEXT_CHARS   = 6000;\nconst MAX_SUMMARY_CHARS   = 1000;\nconst MAX_TOKENS          = 800;\nconst FALLBACK_CONFIDENCE = 0.3;\n\nconst VALID_IMPACT_LEVELS      = new Set(['HIGH', 'MED', 'LOW', 'UNSET']);\nconst VALID_SIGNAL_TYPES       = new Set(['trial_update', 'regulatory', 'publication', 'conference', 'safety', 'news', 'other']);\nconst VALID_OVERRIDE_STATUSES  = new Set(['escalated', 'downgraded', 'locked', 'none']);\nconst VALID_ACTIONS            = new Set(['ESCALATE', 'MONITOR', 'DISMISS', 'REVIEW']);\n\nconst MODELS = {\n  FLAGSHIP:   'openai/gpt-4.1',\n  STANDARD:   'openai/gpt-4.1-mini',\n  FAST:       'openai/gpt-4.1-nano',\n};\n\n// ─────────────────────────────────────────────\n// 1. HELPERS\n// ─────────────────────────────────────────────\nconst safe = (v, fallback = '') => {\n  if (v === null || v === undefined) return fallback;\n  return String(v)\n    .replace(/[\\u0000-\\u001F\\u007F-\\u009F]/g, '')\n    .replace(/\\s+/g, ' ')\n    .trim() || fallback;\n};\n\nconst safeUpper = (v, fallback = 'UNKNOWN') =>\n  safe(v, fallback).toUpperCase();\n\nconst safeLower = (v, fallback = 'unknown') =>\n  safe(v, fallback).toLowerCase();\n\nconst toNumberOrNull = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : null;\n};\n\nconst clamp = (n, min, max) => Math.max(min, Math.min(n, max));\n\nconst isoNow = () => new Date().toISOString();\n\nconst truncate = (str, maxLen) =>\n  str.length > maxLen\n    ? str.slice(0, maxLen) + '\\n...[truncated]'\n    : str;\n\nconst coalesceStr = (...args) => {\n  for (const v of args) {\n    const s = safe(v);\n    if (s) return s;\n  }\n  return '';\n};\n\n// ─────────────────────────────────────────────\n// 2. INPUT\n// ─────────────────────────────────────────────\nconst s = $input.item.json;\n\nif (!s || typeof s !== 'object') {\n  throw new Error('[OncoWatch] Input item is null or not an object.');\n}\n\n// ─────────────────────────────────────────────\n// 3. NORMALIZE CORE FIELDS\n// ─────────────────────────────────────────────\nconst signalId    = coalesceStr(s.source_id, s.id) || null;\nconst drug        = safe(coalesceStr(s.key_drug, s.drug_name), 'Unknown');\nconst indication  = safe(coalesceStr(s.key_indication, s.indication), 'Unknown');\nconst sponsor     = safe(s.sponsor, 'Unknown');\nconst phase       = safe(coalesceStr(s.phase, s.trial_phase), 'NA');\nconst status      = safe(coalesceStr(s.status, s.trial_status), 'NA');\nconst title       = safe(s.title, 'NA');\nconst url         = safe(s.url, '');\nconst source      = safe(s.source, 'unknown');\n\n// Signal type: validate against whitelist, default 'other'\nconst rawSignalType = safeLower(coalesceStr(s.signal_type, 'other'));\nconst signalType    = VALID_SIGNAL_TYPES.has(rawSignalType) ? rawSignalType : 'other';\n\nconst competitor = !!s.competitor_flag;\nconst isUrgent   = !!s.is_urgent;\n\n// Impact level: validate against whitelist, default 'UNSET'\nconst rawPrevLevel   = safeUpper(coalesceStr(s.impact_level, s.previous_impact_level, 'UNSET'));\nconst previousImpactLevel = VALID_IMPACT_LEVELS.has(rawPrevLevel) ? rawPrevLevel : 'UNSET';\nconst previousImpactScore = toNumberOrNull(s.impact_score ?? s.previous_impact_score);\n\n// Override\nconst rawOverride     = safeLower(s.override_status || 'none');\nconst overrideStatus  = VALID_OVERRIDE_STATUSES.has(rawOverride) ? rawOverride : 'none';\nconst overrideBy      = safe(s.override_by, '');\nconst overrideReason  = safe(s.override_reason, '');\nconst overrideAt      = s.override_at || null;\n\n// Timestamps and versioning\nconst ingestedAt  = s.ingested_at || null;\nconst firstSeenAt = s.first_seen_at || null;\nconst lastSeenAt  = s.last_seen_at || null;\nconst version     = Number.isInteger(s.version) ? s.version : 1;\nconst scoringVer  = Number.isInteger(s.scoring_version) ? s.scoring_version : 0;\n\n// Priority base\nconst priorityBase = toNumberOrNull(s.priority_base);\nconst ageHours     = toNumberOrNull(s.age_hours);\n\n// ─────────────────────────────────────────────\n// 4. CONTEXT EXTRACTION + COMPRESSION\n// ─────────────────────────────────────────────\nconst rawBlocks = [];\n\n// Primary: raw_text (string or object)\nif (s.raw_text) {\n  if (typeof s.raw_text === 'string') {\n    rawBlocks.push(truncate(s.raw_text, MAX_CONTEXT_CHARS));\n  } else if (typeof s.raw_text === 'object') {\n    const CTX_KEYS = ['abstract', 'summary', 'description', 'title', 'notes', 'body', 'text'];\n    for (const k of CTX_KEYS) {\n      if (s.raw_text[k]) rawBlocks.push(safe(s.raw_text[k]));\n    }\n    if (rawBlocks.length === 0) {\n      try { rawBlocks.push(JSON.stringify(s.raw_text)); }\n      catch (_) { rawBlocks.push('[raw_text: unserializable object]'); }\n    }\n  }\n}\n\n// Fallback: ai_summary, title, indication\nif (rawBlocks.length === 0) {\n  if (s.ai_summary) rawBlocks.push(truncate(safe(s.ai_summary), MAX_SUMMARY_CHARS));\n  if (title && title !== 'NA') rawBlocks.push(`Title: ${title}`);\n  if (indication && indication !== 'Unknown') rawBlocks.push(`Indication: ${indication}`);\n  if (drug && drug !== 'Unknown') rawBlocks.push(`Drug: ${drug}`);\n  if (sponsor && sponsor !== 'Unknown') rawBlocks.push(`Sponsor: ${sponsor}`);\n}\n\nconst combinedRaw = truncate(rawBlocks.join('\\n\\n'), MAX_CONTEXT_CHARS);\n\n// ─────────────────────────────────────────────\n// 5. PRE-LLM SIGNAL QUALITY ASSESSMENT\n// ─────────────────────────────────────────────\nlet qualityScore = 0; // 0–10\nconst qualityFlags = [];\n\nif (drug !== 'Unknown')        { qualityScore += 2; } else { qualityFlags.push('missing_drug'); }\nif (indication !== 'Unknown')  { qualityScore += 2; } else { qualityFlags.push('missing_indication'); }\nif (sponsor !== 'Unknown')     { qualityScore += 1; } else { qualityFlags.push('missing_sponsor'); }\nif (phase !== 'NA')            { qualityScore += 1; } else { qualityFlags.push('missing_phase'); }\nif (combinedRaw.length > 200)  { qualityScore += 2; } else { qualityFlags.push('sparse_context'); }\nif (url)                       { qualityScore += 1; } else { qualityFlags.push('missing_url'); }\nif (title && title !== 'NA')   { qualityScore += 1; } else { qualityFlags.push('missing_title'); }\n\nconst contextQuality =\n  qualityScore >= 8 ? 'RICH' :\n  qualityScore >= 5 ? 'ADEQUATE' :\n  qualityScore >= 3 ? 'SPARSE' : 'MINIMAL';\n\n// ─────────────────────────────────────────────\n// 6. GUARDRAILS + OVERRIDE LOGIC\n// ─────────────────────────────────────────────\nconst hasStrongOverride =\n  overrideStatus === 'escalated' ||\n  overrideStatus === 'downgraded' ||\n  overrideStatus === 'locked';\n\nconst safetyFloorLevel = hasStrongOverride ? previousImpactLevel : 'LOW';\n\n// ─────────────────────────────────────────────\n// 7. MODEL ROUTING\n// ─────────────────────────────────────────────\nlet modelRoutingReason;\nlet model;\n\nif (isUrgent && competitor) {\n  model = MODELS.FLAGSHIP;\n  modelRoutingReason = 'urgent_AND_competitor → flagship';\n} else if (isUrgent || competitor) {\n  model = MODELS.FLAGSHIP;\n  modelRoutingReason = 'urgent_OR_competitor → flagship';\n} else if (hasStrongOverride) {\n  model = MODELS.STANDARD;\n  modelRoutingReason = 'strong_human_override → standard';\n} else if (contextQuality === 'MINIMAL') {\n  model = MODELS.FAST;\n  modelRoutingReason = 'minimal_context → fast';\n} else {\n  model = MODELS.STANDARD;\n  modelRoutingReason = 'default → standard';\n}\n\n// ─────────────────────────────────────────────\n// 8. TEMPERATURE SELECTION\n// ─────────────────────────────────────────────\nlet baseTemp;\nif (isUrgent) {\n  baseTemp = 0.15;\n} else if (previousImpactLevel === 'HIGH') {\n  baseTemp = 0.2;\n} else if (contextQuality === 'MINIMAL') {\n  baseTemp = 0.4;\n} else {\n  baseTemp = 0.3;\n}\nconst temperature = clamp(baseTemp, 0, 0.7);\n\n// ─────────────────────────────────────────────\n// 9. FEATURES OBJECT (model-facing)\n// ─────────────────────────────────────────────\nconst features = {\n  signal_id: signalId,\n  drug,\n  indication,\n  sponsor,\n  source,\n  trial_phase: phase,\n  trial_status: status,\n  current_signal_type: signalType,\n  competitor_flag: competitor,\n  previous_impact_level: previousImpactLevel,\n  previous_impact_score: previousImpactScore,\n  override_status: overrideStatus,\n  override_by: overrideBy || null,\n  override_reason: overrideReason || null,\n  override_at: overrideAt,\n  is_urgent: isUrgent,\n  priority_base: priorityBase,\n  age_hours: ageHours,\n  context_quality: contextQuality,\n  quality_score: qualityScore,\n  quality_flags: qualityFlags,\n  ingested_at: ingestedAt,\n  first_seen_at: firstSeenAt,\n  last_seen_at: lastSeenAt,\n  version,\n  scoring_version: scoringVer,\n  url: url || null,\n};\n\n// ─────────────────────────────────────────────\n// 10. SYSTEM PROMPT (override-aware, structured)\n// ─────────────────────────────────────────────\nconst systemPrompt = `\nYou are an oncology competitive intelligence (CI) triage assistant for a large pharmaceutical company.\n\nROLE:\n- You analyze CI signals from clinical trial registries, regulatory filings, publications, news, and conferences.\n- You produce structured triage scores to help medical affairs and CI teams prioritize responses.\n\nINPUT:\n1) A structured JSON \"features\" object describing a CI signal.\n2) Unstructured context text (trial protocol, abstract, news article, or registry entry).\n\nTASKS:\n- Re-assess \"impact_level\" ∈ {\"HIGH\",\"MED\",\"LOW\"} using both features and context.\n- Assign \"impact_score\" ∈ [0,10] (10 = highest strategic threat or opportunity).\n- Refine \"signal_type\" ∈ {\"trial_update\",\"regulatory\",\"publication\",\"conference\",\"safety\",\"news\",\"other\"}.\n- Decide \"competitor_flag\" (true/false) based on sponsor, drug, and indication.\n- Generate \"ai_summary\": 2–4 concise sentences tailored for pharma CI / medical affairs.\n- Set \"recommended_action\" ∈ {\"ESCALATE\",\"MONITOR\",\"DISMISS\",\"REVIEW\"}.\n- Provide \"score_breakdown\":\n  - \"drivers\": array of 2–6 short phrases raising the score.\n  - \"risks\": array of 1–5 short phrases capturing uncertainty / caveats.\n  - \"confidence\": float in [0,1].\n\nGUARDRAILS:\n- Prefer MED over LOW when there is credible signal with any supporting context.\n- If context_quality = \"MINIMAL\" or \"SPARSE\", keep confidence ≤ 0.45.\n- If override_status = \"escalated\" or \"locked\", do NOT downgrade unless evidence is overwhelming.\n- If override_status = \"downgraded\", do NOT upgrade unless evidence strongly justifies it.\n- Never add commentary, prose, or markdown outside the JSON.\n\nMETADATA CONTEXT:\n- signal_id: ${signalId || 'NA'}\n- override_status: ${overrideStatus}\n- previous_impact_level: ${previousImpactLevel}\n- previous_impact_score: ${previousImpactScore ?? 'NA'}\n- context_quality: ${contextQuality} (score: ${qualityScore}/10)\n- quality_flags: ${qualityFlags.length > 0 ? qualityFlags.join(', ') : 'none'}\n- safety_floor_impact_level: ${safetyFloorLevel}\n- model_routing_reason: ${modelRoutingReason}\n- pipeline_version: ${PIPELINE_VERSION}\n\nOUTPUT CONTRACT:\nReturn ONLY a single strict JSON object with EXACT keys:\n{\n  \"impact_level\": string,\n  \"impact_score\": number,\n  \"signal_type\": string,\n  \"competitor_flag\": boolean,\n  \"ai_summary\": string,\n  \"recommended_action\": string,\n  \"score_breakdown\": {\n    \"drivers\": string[],\n    \"risks\": string[],\n    \"confidence\": number\n  }\n}\n`.trim();\n\n// ─────────────────────────────────────────────\n// 11. USER PROMPT\n// ─────────────────────────────────────────────\nconst aiInputText = `\nINSTRUCTIONS:\n${systemPrompt}\n\nFEATURES (JSON):\n${JSON.stringify(features, null, 2)}\n\nCONTEXT:\n${combinedRaw || 'No context available.'}\n`.trim();\n\n// ─────────────────────────────────────────────\n// 12. OPENROUTER REQUEST BODY\n// ─────────────────────────────────────────────\nconst openrouterBody = {\n  model,\n  messages: [\n    { role: 'system', content: systemPrompt },\n    { role: 'user', content: aiInputText }\n  ],\n  response_format: { type: 'json_object' },\n  temperature,\n  top_p: 0.9,\n  max_tokens: MAX_TOKENS,\n  metadata: {\n    client: 'OncoWatch',\n    task: 'ci_ai_triage',\n    pipeline_version: PIPELINE_VERSION,\n    signal_id: signalId || null,\n    drug,\n    indication,\n    sponsor,\n    trial_phase: phase,\n    trial_status: status,\n    source,\n    competitor_flag_input: competitor,\n    urgent_input: isUrgent,\n    override_status: overrideStatus,\n    override_by: overrideBy || null,\n    override_reason: overrideReason || null,\n    previous_impact_level: previousImpactLevel,\n    previous_impact_score: previousImpactScore,\n    context_quality: contextQuality,\n    quality_score: qualityScore,\n    quality_flags: qualityFlags,\n    model_routing_reason: modelRoutingReason,\n    scoring_version: scoringVer,\n    payload_version: version,\n    first_seen_at: firstSeenAt,\n    last_seen_at: lastSeenAt,\n    ingested_at: ingestedAt,\n    source_url: url || null,\n    built_at: isoNow(),\n  }\n};\n\n// ─────────────────────────────────────────────\n// 13. RETURN ENRICHED ITEM\n// ─────────────────────────────────────────────\nreturn [\n  {\n    json: {\n      ...s,\n      ai_features: features,\n      ai_input_text: aiInputText,\n      openrouter_body: openrouterBody,\n      _meta: {\n        pipeline_version: PIPELINE_VERSION,\n        model_selected: model,\n        model_routing_reason: modelRoutingReason,\n        context_quality: contextQuality,\n        quality_score: qualityScore,\n        quality_flags: qualityFlags,\n        temperature,\n        built_at: isoNow(),\n      }\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "94d69aee-4930-4ba5-8d87-942796eb9c65",
+      "name": "Build AI Input"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ============================================================\n * OncoWatch CI Triage — Merge AI Output\n * Version: 3.2.0\n * No Merge node required.\n * Reads HTTP response from $input, original signal from $('Build AI Input')\n * ============================================================\n */\n\n// ─────────────────────────────────────────────\n// 1. GET BOTH DATA SOURCES\n// ─────────────────────────────────────────────\n\n// HTTP response from the node immediately before this one\nconst httpRaw = $input.item.json;\n\n// Original enriched signal — pulled directly from the Build AI Input node\n// NOTE: Change 'Build AI Input' below to match your exact node name\nlet original;\ntry {\n  original = $('Build AI Input').item.json;\n} catch (e) {\n  throw new Error(\n    '[OncoWatch] Merge: Could not read \"Build AI Input\" node. ' +\n    'Check the node name matches exactly. Error: ' + e.message\n  );\n}\n\n// ─────────────────────────────────────────────\n// 2. VALIDATE\n// ─────────────────────────────────────────────\nif (!httpRaw || typeof httpRaw !== 'object') {\n  throw new Error('[OncoWatch] Merge: HTTP response is null or not an object.');\n}\n\nif (!original || typeof original !== 'object') {\n  throw new Error('[OncoWatch] Merge: Original signal is null or not an object.');\n}\n\n// ─────────────────────────────────────────────\n// 3. EXTRACT LLM CONTENT\n// ─────────────────────────────────────────────\nlet content = null;\n\n// Shape A: standard chat completions\nif (\n  Array.isArray(httpRaw.choices) &&\n  httpRaw.choices.length > 0 &&\n  httpRaw.choices[0]?.message?.content\n) {\n  content = httpRaw.choices[0].message.content;\n}\n\n// Shape B: streaming delta\nif (\n  content === null &&\n  Array.isArray(httpRaw.choices) &&\n  httpRaw.choices.length > 0 &&\n  httpRaw.choices[0]?.delta?.content\n) {\n  content = httpRaw.choices[0].delta.content;\n}\n\n// Shape C: raw.result wrapper\nif (content === null && httpRaw.result !== undefined) {\n  content = httpRaw.result;\n}\n\n// Shape D: already parsed object\nif (content === null && httpRaw.impact_level) {\n  content = httpRaw;\n}\n\nif (content === null) {\n  throw new Error(\n    '[OncoWatch] Merge: Could not find LLM content. HTTP keys: ' +\n    Object.keys(httpRaw).join(', ')\n  );\n}\n\n// ─────────────────────────────────────────────\n// 4. PARSE JSON\n// ─────────────────────────────────────────────\nlet payload;\nif (typeof content === 'string') {\n  const cleaned = content\n    .trim()\n    .replace(/^```json[\\r\\n]*/i, '')\n    .replace(/^```[\\r\\n]*/,       '')\n    .replace(/```$/,               '')\n    .trim();\n  try {\n    payload = JSON.parse(cleaned);\n  } catch (e) {\n    throw new Error(\n      '[OncoWatch] Merge: JSON parse failed — ' + e.message +\n      ' | content(trunc): ' + cleaned.slice(0, 400)\n    );\n  }\n} else if (typeof content === 'object' && content !== null) {\n  payload = content;\n} else {\n  throw new Error('[OncoWatch] Merge: Unexpected content type: ' + typeof content);\n}\n\n// ─────────────────────────────────────────────\n// 5. HELPERS\n// ─────────────────────────────────────────────\nconst numOr = (v, fallback) => {\n  if (typeof v === 'number' && Number.isFinite(v)) return v;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : fallback;\n};\nconst clamp = (n, min, max) => Math.max(min, Math.min(n, max));\n\nconst VALID_IMPACT  = new Set(['HIGH', 'MED', 'LOW']);\nconst VALID_ACTIONS = new Set(['ESCALATE', 'MONITOR', 'DISMISS', 'REVIEW']);\nconst VALID_TYPES   = new Set(['trial_update','regulatory','publication','conference','safety','news','other']);\n\nconst safeImpact = (v) => { const u = String(v||'').toUpperCase(); return VALID_IMPACT.has(u)  ? u : 'LOW';     };\nconst safeAction = (v) => { const u = String(v||'').toUpperCase(); return VALID_ACTIONS.has(u) ? u : 'MONITOR'; };\nconst safeType   = (v) => { const l = String(v||'').toLowerCase(); return VALID_TYPES.has(l)   ? l : 'other';   };\n\n// ─────────────────────────────────────────────\n// 6. NORMALIZE LLM OUTPUT\n// ─────────────────────────────────────────────\nconst impactLevel = safeImpact(payload.impact_level);\nconst impactScore = clamp(numOr(payload.impact_score, 0), 0, 10);\nconst signalType  = safeType(payload.signal_type);\nconst compFlag    = !!payload.competitor_flag;\nconst aiSummary   = String(payload.ai_summary || '').trim();\nconst recAction   = safeAction(payload.recommended_action);\n\nconst scoreBreakdown = {\n  drivers:    Array.isArray(payload.score_breakdown?.drivers) ? payload.score_breakdown.drivers.map(String) : [],\n  risks:      Array.isArray(payload.score_breakdown?.risks)   ? payload.score_breakdown.risks.map(String)   : [],\n  confidence: clamp(numOr(payload.score_breakdown?.confidence, 0.3), 0, 1)\n};\n\n// ─────────────────────────────────────────────\n// 7. PULL META FROM ORIGINAL ITEM\n// ─────────────────────────────────────────────\nconst meta     = original._meta           || {};\nconst features = original.ai_features     || {};\nconst orBody   = original.openrouter_body || {};\n\n// ─────────────────────────────────────────────\n// 8. BUILD FULLY MERGED OUTPUT\n// ─────────────────────────────────────────────\nconst merged = {\n  // Original signal fields\n  id:                 original.id               || null,\n  source_id:          original.source_id        || null,\n  source:             original.source           || null,\n  title:              original.title            || null,\n  drug_name:          original.drug_name        || features.drug         || null,\n  key_drug:           original.key_drug         || features.drug         || null,\n  indication:         original.indication       || features.indication   || null,\n  key_indication:     original.key_indication   || features.indication   || null,\n  sponsor:            original.sponsor          || features.sponsor      || null,\n  phase:              original.phase            || features.trial_phase  || null,\n  status:             original.status           || features.trial_status || null,\n  url:                original.url              || features.url          || null,\n  raw_text:           original.raw_text         || null,\n  ingested_at:        original.ingested_at      || null,\n  first_seen_at:      original.first_seen_at    || null,\n  last_seen_at:       original.last_seen_at     || null,\n  version:            original.version          ?? null,\n  scoring_version:    original.scoring_version  ?? null,\n  override_status:    original.override_status  || 'none',\n  override_by:        original.override_by      || null,\n  override_reason:    original.override_reason  || null,\n  override_at:        original.override_at      || null,\n  is_urgent:          original.is_urgent        ?? false,\n  priority_base:      original.priority_base    ?? null,\n  age_hours:          original.age_hours        ?? null,\n  daily_sent:         original.daily_sent       ?? false,\n  weekly_sent:        original.weekly_sent      ?? false,\n  retry_count:        original.retry_count      ?? 0,\n\n  // AI triage outputs\n  competitor_flag:    compFlag,\n  impact_level:       impactLevel,\n  impact_score:       impactScore,\n  signal_type:        signalType,\n  ai_summary:         aiSummary,\n  recommended_action: recAction,\n  score_breakdown:    scoreBreakdown,\n  ai_processed:       true,\n  processed:          true,\n  refusal:            payload.refusal   ?? null,\n  reasoning:          payload.reasoning ?? null,\n\n  // Observability block — all from original._meta (not OpenRouter metadata)\n  _triage_meta: {\n    model_used:           httpRaw.model                   || orBody.model               || null,\n    model_routing_reason: meta.model_routing_reason       || null,\n    context_quality:      meta.context_quality            || features.context_quality   || null,\n    quality_score:        meta.quality_score              ?? features.quality_score     ?? null,\n    quality_flags:        meta.quality_flags              || features.quality_flags     || [],\n    pipeline_version:     meta.pipeline_version           || null,\n    temperature_used:     meta.temperature                ?? null,\n    prompt_tokens:        httpRaw.usage?.prompt_tokens    ?? null,\n    completion_tokens:    httpRaw.usage?.completion_tokens ?? null,\n    total_tokens:         httpRaw.usage?.total_tokens     ?? null,\n    merged_at:            new Date().toISOString(),\n  }\n};\n\nreturn [{ json: merged }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        0
+      ],
+      "id": "801a4d63-30a0-425c-950c-dd5cf5497bff",
+      "name": "Merge AI Output"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals AS s\nSET\n  -- Core AI triage fields\n  impact_level       = COALESCE('HIGH', s.impact_level),\n  impact_score       = COALESCE(8.5, s.impact_score),\n  signal_type        = COALESCE('trial_update', s.signal_type),\n  ai_summary         = COALESCE(\n                         'A Phase II trial of Ivonescimab in advanced clear cell renal cell carcinoma is actively recruiting at M.D. Anderson Cancer Center. The study focuses on previously treated patients, highlighting potential for new therapeutic strategies in a highly competitive space. Given the trial''s strategic relevance and prior escalation, ongoing monitoring is critical. The results could impact future treatment paradigms and market positioning.',\n                         s.ai_summary\n                       ),\n  competitor_flag    = COALESCE(false, s.competitor_flag),\n  recommended_action = COALESCE('ESCALATE', s.recommended_action),\n\n  -- JSONB score breakdown: merge if existing, else set new\n  score_breakdown    = CASE\n                         WHEN s.score_breakdown IS NULL THEN\n                           '{\"drivers\":[\"Phase II trial in competitive indication\",\"Recruiting status at major cancer center\",\"Potential to shift treatment paradigms\",\"Previously escalated due to strategic relevance\"],\"risks\":[\"No efficacy or safety data yet available\",\"Sponsor is academic, not industry competitor\"],\"confidence\":0.95}'::jsonb\n                         ELSE\n                           s.score_breakdown || '{\"drivers\":[\"Phase II trial in competitive indication\",\"Recruiting status at major cancer center\",\"Potential to shift treatment paradigms\",\"Previously escalated due to strategic relevance\"],\"risks\":[\"No efficacy or safety data yet available\",\"Sponsor is academic, not industry competitor\"],\"confidence\":0.95}'::jsonb\n                       END,\n\n  -- Versioning and AI governance\n  scoring_version    = GREATEST(COALESCE(s.scoring_version, 0), 1),\n  version            = GREATEST(COALESCE(s.version, 0), 9),\n  ai_processed       = true,\n\n  -- Urgency & override interplay\n  is_urgent          = COALESCE(true, s.is_urgent),\n\n  -- Timestamps\n  first_seen_at      = COALESCE(s.first_seen_at, NOW()),\n  last_seen_at       = NOW(),\n\n  -- Retry bookkeeping (success path)\n  retry_count        = COALESCE(s.retry_count, 0),\n\n  -- Keep existing override metadata\n  override_status    = COALESCE(s.override_status, 'none'),\n  override_by        = s.override_by,\n  override_at        = s.override_at,\n  override_reason    = s.override_reason\n\nWHERE\n  s.source_id = 'NCT06940518'\n  AND COALESCE(s.scoring_version, 0) <= 1;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1232,
+        0
+      ],
+      "id": "b1b4d833-59d2-49fd-93e7-06c790d251d3",
+      "name": "Update Signal with AI Triage",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a9ec0584-330a-4421-b7bb-7b00adb602e5",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "CRITICAL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "67d0e431-2e02-4e8c-ab92-11c667b8dadc",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "HIGH_COMPETITOR",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d35dadfc-407e-4c17-971b-c955064b4e84",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "HIGH",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "e3aa25fc-8aca-425f-b685-2aa960e8384e",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "MED_ELEVATED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "9459e16c-c33a-4872-b7b8-92127949fec6",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "MED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "207a4942-8d35-4a10-88bb-467227b87e91",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "LOW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "74b9c66b-77fc-4182-ab28-ca29bd4c81f4",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "DISMISS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "798b73ed-6c74-4fa5-9146-c0ad14fde485",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "AI_FAILED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "e192dd44-69c3-4f09-a901-31a5d8d96877",
+                    "leftValue": "={{ $json.route_tier }}",
+                    "rightValue": "DB_FAILED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1584,
+        -176
+      ],
+      "id": "7276f148-9e98-4131-9aae-bbba4fa56f45",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.openrouter_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        656,
+        0
+      ],
+      "id": "28604232-3def-4be5-a1d9-0c80e8c82bd1",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7mr2YA0p7FAupMHh",
+          "name": "Openrouter API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ╔══════════════════════════════════════════════════════════════════╗\n * ║   OncoWatch CI Triage — Restore Signal + Advanced Pre-Router    ║\n * ║   Version  : 5.0.0                                              ║\n * ║   Stage    : Production / Investor-Grade                        ║\n * ║   Author   : OncoWatch Pipeline Engine                          ║\n * ╠══════════════════════════════════════════════════════════════════╣\n * ║  Responsibilities:                                              ║\n * ║  1.  Restore full CI signal after Update Signal node            ║\n * ║  2.  Validate + sanitize every field                            ║\n * ║  3.  Compute composite priority score (7-factor model)          ║\n * ║  4.  Determine route tier (9-tier system)                       ║\n * ║  5.  Assign alert channels per tier                             ║\n * ║  6.  Compute notification priority (P0–P4)                      ║\n * ║  7.  Detect override compliance violations                      ║\n * ║  8.  Generate audit trail entry                                 ║\n * ║  9.  Compute signal velocity (version-based change rate)        ║\n * ║  10. Emit enriched item for Switch node                         ║\n * ╚══════════════════════════════════════════════════════════════════╝\n */\n\n'use strict';\n\n// ══════════════════════════════════════════════════════════════════\n// 0. PIPELINE CONSTANTS\n// ══════════════════════════════════════════════════════════════════\nconst PIPELINE_VERSION           = '5.0.0';\nconst CRITICAL_PRIORITY_THRESHOLD = 9.0;\nconst HIGH_PRIORITY_THRESHOLD     = 7.0;\nconst MED_ELEVATED_THRESHOLD      = 5.5;\nconst URGENT_AGE_HOURS_THRESHOLD  = 48;\nconst CONFIDENCE_ALERT_MIN        = 0.60;\nconst CONFIDENCE_HIGH_MIN         = 0.75;\nconst MAX_RETRY_AI                = 3;\nconst MAX_RETRY_DB                = 5;\n\nconst ROUTE_TIERS = Object.freeze({\n  CRITICAL        : 'CRITICAL',\n  HIGH_COMPETITOR : 'HIGH_COMPETITOR',\n  HIGH            : 'HIGH',\n  MED_ELEVATED    : 'MED_ELEVATED',\n  MED             : 'MED',\n  LOW             : 'LOW',\n  DISMISS         : 'DISMISS',\n  AI_FAILED       : 'AI_FAILED',\n  DB_FAILED       : 'DB_FAILED',\n});\n\nconst NOTIF_PRIORITY = Object.freeze({\n  CRITICAL        : 'P0',\n  HIGH_COMPETITOR : 'P1',\n  HIGH            : 'P1',\n  MED_ELEVATED    : 'P2',\n  MED             : 'P3',\n  LOW             : 'P4',\n  DISMISS         : 'P5',\n  AI_FAILED       : 'P1',\n  DB_FAILED       : 'P0',\n});\n\nconst CHANNEL_MAP = Object.freeze({\n  CRITICAL        : ['slack_exec', 'slack_medical_affairs', 'slack_ci_team', 'email_exec', 'pagerduty'],\n  HIGH_COMPETITOR : ['slack_ci_team', 'slack_medical_affairs', 'email_ci_team'],\n  HIGH            : ['slack_medical_affairs', 'slack_ci_team'],\n  MED_ELEVATED    : ['slack_ci_team'],\n  MED             : ['digest_daily'],\n  LOW             : ['digest_weekly'],\n  DISMISS         : ['archive'],\n  AI_FAILED       : ['slack_ops', 'pagerduty'],\n  DB_FAILED       : ['slack_ops', 'pagerduty', 'email_ops'],\n});\n\nconst VALID_IMPACT_LEVELS  = new Set(['HIGH', 'MED', 'LOW', 'UNSET']);\nconst VALID_SIGNAL_TYPES   = new Set(['trial_update','regulatory','publication','conference','safety','news','other']);\nconst VALID_ACTIONS        = new Set(['ESCALATE','MONITOR','DISMISS','REVIEW']);\nconst VALID_OVERRIDE_STATS = new Set(['escalated','downgraded','locked','none']);\n\n\n// ══════════════════════════════════════════════════════════════════\n// 1. UTILITY FUNCTIONS\n// ══════════════════════════════════════════════════════════════════\nconst numOr = (v, fallback) => {\n  if (typeof v === 'number' && Number.isFinite(v)) return v;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : fallback;\n};\n\nconst clamp       = (n, min, max) => Math.max(min, Math.min(n, max));\nconst isoNow      = () => new Date().toISOString();\nconst round2      = (n) => Math.round(n * 100) / 100;\nconst safeStr     = (v, fb = '') => (v === null || v === undefined ? fb : String(v).trim() || fb);\nconst safeUpper   = (v, fb = '') => safeStr(v, fb).toUpperCase();\nconst safeLower   = (v, fb = '') => safeStr(v, fb).toLowerCase();\nconst safeBool    = (v) => v === true || v === 'true' || v === 1;\n\nconst validateEnum = (v, validSet, fallback) => {\n  const u = safeUpper(v);\n  return validSet.has(u) ? u : fallback;\n};\n\nconst validateEnumLower = (v, validSet, fallback) => {\n  const l = safeLower(v);\n  return validSet.has(l) ? l : fallback;\n};\n\nconst hoursAgo = (isoStr) => {\n  if (!isoStr) return null;\n  const ms = Date.now() - new Date(isoStr).getTime();\n  return Number.isFinite(ms) ? round2(ms / 3600000) : null;\n};\n\n\n// ══════════════════════════════════════════════════════════════════\n// 2. ACQUIRE INPUTS\n// ══════════════════════════════════════════════════════════════════\nconst updateResult = $input.item.json;\n\nlet fullSignal;\ntry {\n  fullSignal = $('Merge AI Output').item.json;\n} catch (err) {\n  throw new Error(\n    '[OncoWatch:Restore] Cannot read \"Merge AI Output\" node. ' +\n    'Verify exact node name. Original error: ' + err.message\n  );\n}\n\nif (!updateResult || typeof updateResult !== 'object') {\n  throw new Error('[OncoWatch:Restore] updateResult is null/not-object.');\n}\nif (!fullSignal || typeof fullSignal !== 'object') {\n  throw new Error('[OncoWatch:Restore] fullSignal is null/not-object.');\n}\n\n\n// ══════════════════════════════════════════════════════════════════\n// 3. NORMALIZE + VALIDATE ALL FIELDS\n// ══════════════════════════════════════════════════════════════════\nconst signalId       = safeStr(fullSignal.source_id || fullSignal.id, null);\nconst drug           = safeStr(fullSignal.key_drug   || fullSignal.drug_name,  'Unknown');\nconst indication     = safeStr(fullSignal.key_indication || fullSignal.indication, 'Unknown');\nconst sponsor        = safeStr(fullSignal.sponsor, 'Unknown');\nconst phase          = safeStr(fullSignal.phase   || fullSignal.trial_phase,   'NA');\nconst trialStatus    = safeStr(fullSignal.status  || fullSignal.trial_status,  'NA');\nconst title          = safeStr(fullSignal.title,   'NA');\nconst source         = safeStr(fullSignal.source,  'unknown');\nconst url            = safeStr(fullSignal.url,     '');\n\nconst impactLevel    = validateEnum(fullSignal.impact_level, VALID_IMPACT_LEVELS, 'LOW');\nconst impactScore    = clamp(numOr(fullSignal.impact_score, 0), 0, 10);\nconst signalType     = validateEnumLower(fullSignal.signal_type, VALID_SIGNAL_TYPES, 'other');\nconst recAction      = validateEnum(fullSignal.recommended_action, VALID_ACTIONS, 'MONITOR');\nconst overrideStatus = validateEnumLower(fullSignal.override_status, VALID_OVERRIDE_STATS, 'none');\nconst overrideBy     = safeStr(fullSignal.override_by,     '');\nconst overrideReason = safeStr(fullSignal.override_reason, '');\n\nconst isUrgent       = safeBool(fullSignal.is_urgent);\nconst competitor     = safeBool(fullSignal.competitor_flag);\nconst aiProcessed    = safeBool(fullSignal.ai_processed);\nconst dbSuccess      = safeBool(updateResult.success);\n\nconst confidence     = clamp(numOr(fullSignal.score_breakdown?.confidence, 0), 0, 1);\nconst drivers        = Array.isArray(fullSignal.score_breakdown?.drivers) ? fullSignal.score_breakdown.drivers : [];\nconst risks          = Array.isArray(fullSignal.score_breakdown?.risks)   ? fullSignal.score_breakdown.risks   : [];\n\nconst version        = numOr(fullSignal.version,         1);\nconst scoringVersion = numOr(fullSignal.scoring_version, 0);\nconst retryCountAI   = numOr(fullSignal.retry_count,     0);\nconst retryCountSafe = numOr(fullSignal.retry_count_safe, 0);\nconst priorityBase   = numOr(fullSignal.priority_base,   null);\n\nconst ingestedAt     = fullSignal.ingested_at   || null;\nconst firstSeenAt    = fullSignal.first_seen_at || null;\nconst lastSeenAt     = fullSignal.last_seen_at  || null;\n\nconst computedAgeHours = hoursAgo(firstSeenAt) || numOr(fullSignal.age_hours, 0);\n\nconst dailySent  = safeBool(fullSignal.daily_sent);\nconst weeklySent = safeBool(fullSignal.weekly_sent);\n\nconst triageMeta    = fullSignal._triage_meta   || {};\nconst routingMeta   = fullSignal._routing_meta  || {};\nconst pipelineMeta  = fullSignal._meta          || {};\n\n\n// ══════════════════════════════════════════════════════════════════\n// 4. COMPOSITE PRIORITY SCORE (7-factor weighted model)\n// ══════════════════════════════════════════════════════════════════\n/*\n  Factor                    Max contribution\n  ─────────────────────────────────────────\n  Base impact score         10.0  (direct passthrough)\n  Competitor flag           +2.0\n  Urgency flag              +2.0\n  Override: escalated       +1.5\n  Recency (<48h)            +1.0\n  High confidence (≥0.75)   +0.75\n  Moderate confidence       +0.5\n  Override: downgraded      -2.0\n  Capped at 10.0\n*/\nlet priorityScore = impactScore;\n\nif (competitor)                             priorityScore += 2.0;\nif (isUrgent)                               priorityScore += 2.0;\nif (overrideStatus === 'escalated')         priorityScore += 1.5;\nif (overrideStatus === 'downgraded')        priorityScore -= 2.0;\nif (computedAgeHours < URGENT_AGE_HOURS_THRESHOLD) priorityScore += 1.0;\nif (confidence >= CONFIDENCE_HIGH_MIN)      priorityScore += 0.75;\nelse if (confidence >= CONFIDENCE_ALERT_MIN) priorityScore += 0.5;\n\npriorityScore = clamp(round2(priorityScore), 0, 10);\n\n\n// ══════════════════════════════════════════════════════════════════\n// 5. ROUTE TIER DETERMINATION (9-tier ordered logic)\n// ══════════════════════════════════════════════════════════════════\nlet routeTier;\n\nif (!dbSuccess) {\n  routeTier = ROUTE_TIERS.DB_FAILED;\n\n} else if (!aiProcessed) {\n  routeTier = ROUTE_TIERS.AI_FAILED;\n\n} else if (\n  priorityScore >= CRITICAL_PRIORITY_THRESHOLD ||\n  (isUrgent && impactLevel === 'HIGH' && competitor) ||\n  overrideStatus === 'locked'\n) {\n  routeTier = ROUTE_TIERS.CRITICAL;\n\n} else if (impactLevel === 'HIGH' && competitor) {\n  routeTier = ROUTE_TIERS.HIGH_COMPETITOR;\n\n} else if (\n  impactLevel === 'HIGH' ||\n  priorityScore >= HIGH_PRIORITY_THRESHOLD\n) {\n  routeTier = ROUTE_TIERS.HIGH;\n\n} else if (\n  impactLevel === 'MED' &&\n  (isUrgent || competitor || priorityScore >= MED_ELEVATED_THRESHOLD)\n) {\n  routeTier = ROUTE_TIERS.MED_ELEVATED;\n\n} else if (impactLevel === 'MED') {\n  routeTier = ROUTE_TIERS.MED;\n\n} else if (recAction === 'DISMISS' || impactLevel === 'LOW') {\n  routeTier = recAction === 'DISMISS'\n    ? ROUTE_TIERS.DISMISS\n    : ROUTE_TIERS.LOW;\n\n} else {\n  routeTier = ROUTE_TIERS.LOW;\n}\n\n\n// ══════════════════════════════════════════════════════════════════\n// 6. ALERT CHANNELS\n// ══════════════════════════════════════════════════════════════════\nconst alertChannels = [...(CHANNEL_MAP[routeTier] || [])];\n\n// Inject urgent override channel if not already present\nif (isUrgent && !alertChannels.includes('slack_exec')) {\n  alertChannels.unshift('slack_exec');\n}\n\n// Deduplicate\nconst uniqueChannels = [...new Set(alertChannels)];\n\n\n// ══════════════════════════════════════════════════════════════════\n// 7. OVERRIDE COMPLIANCE CHECK\n// ══════════════════════════════════════════════════════════════════\nlet overrideViolation = false;\nlet overrideViolationReason = null;\n\nif (overrideStatus === 'escalated' && ['LOW', 'DISMISS'].includes(routeTier)) {\n  overrideViolation = true;\n  overrideViolationReason =\n    `Signal was escalated by ${overrideBy || 'human'} but AI routed to ${routeTier}. Manual review required.`;\n}\nif (overrideStatus === 'locked' && routeTier !== ROUTE_TIERS.CRITICAL) {\n  overrideViolation = true;\n  overrideViolationReason =\n    `Signal is locked by ${overrideBy || 'human'} but AI routed to ${routeTier}. Forced upgrade to CRITICAL.`;\n  routeTier = ROUTE_TIERS.CRITICAL; // force upgrade\n}\nif (overrideStatus === 'downgraded' && routeTier === ROUTE_TIERS.CRITICAL) {\n  overrideViolation = true;\n  overrideViolationReason =\n    `Signal was downgraded by ${overrideBy || 'human'} but AI still scored CRITICAL (score: ${priorityScore}). Flagged for review.`;\n}\n\n\n// ══════════════════════════════════════════════════════════════════\n// 8. SIGNAL VELOCITY (version-based change rate)\n// ══════════════════════════════════════════════════════════════════\nlet signalVelocity = null;\nlet velocityLabel  = 'STABLE';\n\nif (firstSeenAt && lastSeenAt && version > 1) {\n  const spanHours = hoursAgo(firstSeenAt) || 1;\n  const versionsPerHour = round2((version - 1) / spanHours);\n  signalVelocity = versionsPerHour;\n  velocityLabel  =\n    versionsPerHour >= 1.0  ? 'FAST'    :\n    versionsPerHour >= 0.25 ? 'ACTIVE'  :\n    versionsPerHour >= 0.05 ? 'SLOW'    : 'STABLE';\n}\n\n\n// ══════════════════════════════════════════════════════════════════\n// 9. RETRY + DIGEST FLAGS\n// ══════════════════════════════════════════════════════════════════\nconst shouldRetryAI  = !aiProcessed && retryCountAI  < MAX_RETRY_AI;\nconst shouldRetryDB  = !dbSuccess   && retryCountSafe < MAX_RETRY_DB;\nconst sendDaily      = !dailySent   && ['CRITICAL','HIGH_COMPETITOR','HIGH','MED_ELEVATED','MED'].includes(routeTier);\nconst sendWeekly     = !weeklySent  && !['DISMISS','LOW'].includes(routeTier);\n\n\n// ══════════════════════════════════════════════════════════════════\n// 10. AUDIT TRAIL ENTRY\n// ══════════════════════════════════════════════════════════════════\nconst auditEntry = {\n  event:             'SIGNAL_ROUTED',\n  pipeline_version:  PIPELINE_VERSION,\n  signal_id:         signalId,\n  route_tier:        routeTier,\n  notif_priority:    NOTIF_PRIORITY[routeTier] || 'P4',\n  priority_score:    priorityScore,\n  impact_level:      impactLevel,\n  impact_score:      impactScore,\n  confidence:        confidence,\n  competitor_flag:   competitor,\n  is_urgent:         isUrgent,\n  override_status:   overrideStatus,\n  override_violation: overrideViolation,\n  db_success:        dbSuccess,\n  ai_processed:      aiProcessed,\n  signal_velocity:   signalVelocity,\n  velocity_label:    velocityLabel,\n  alert_channels:    uniqueChannels,\n  timestamp:         isoNow(),\n};\n\n\n// ══════════════════════════════════════════════════════════════════\n// 11. BUILD FINAL ENRICHED OUTPUT\n// ══════════════════════════════════════════════════════════════════\nconst enriched = {\n  // ── Original signal fields (all preserved) ──────────────────────\n  id:                signalId,\n  source_id:         signalId,\n  source:            source,\n  title:             title,\n  drug_name:         drug,\n  key_drug:          drug,\n  indication:        indication,\n  key_indication:    indication,\n  sponsor:           sponsor,\n  phase:             phase,\n  status:            trialStatus,\n  url:               url,\n  raw_text:          fullSignal.raw_text       || null,\n  ai_summary:        fullSignal.ai_summary     || '',\n  ingested_at:       ingestedAt,\n  first_seen_at:     firstSeenAt,\n  last_seen_at:      lastSeenAt,\n  version:           version,\n  scoring_version:   scoringVersion,\n  override_status:   overrideStatus,\n  override_by:       overrideBy   || null,\n  override_reason:   overrideReason || null,\n  override_at:       fullSignal.override_at    || null,\n  is_urgent:         isUrgent,\n  priority_base:     priorityBase,\n  age_hours:         computedAgeHours,\n  daily_sent:        dailySent,\n  weekly_sent:       weeklySent,\n  retry_count:       retryCountAI,\n  retry_count_safe:  retryCountSafe,\n  embedding:         fullSignal.embedding      || null,\n\n  // ── AI triage outputs ────────────────────────────────────────────\n  competitor_flag:   competitor,\n  impact_level:      impactLevel,\n  impact_score:      impactScore,\n  signal_type:       signalType,\n  recommended_action: recAction,\n  score_breakdown: {\n    drivers:     drivers,\n    risks:       risks,\n    confidence:  confidence,\n  },\n  ai_processed:      aiProcessed,\n  processed:         true,\n  refusal:           fullSignal.refusal   || null,\n  reasoning:         fullSignal.reasoning || null,\n\n  // ── DB write result ──────────────────────────────────────────────\n  success:           dbSuccess,\n\n  // ── Routing outputs (used by Switch node) ───────────────────────\n  route_tier:        routeTier,\n  priority_score:    priorityScore,\n  notif_priority:    NOTIF_PRIORITY[routeTier] || 'P4',\n  alert_channels:    uniqueChannels,\n  should_retry_ai:   shouldRetryAI,\n  should_retry_db:   shouldRetryDB,\n  send_daily:        sendDaily,\n  send_weekly:       sendWeekly,\n\n  // ── Override compliance ──────────────────────────────────────────\n  override_violation:        overrideViolation,\n  override_violation_reason: overrideViolationReason,\n\n  // ── Signal velocity ──────────────────────────────────────────────\n  signal_velocity:   signalVelocity,\n  velocity_label:    velocityLabel,\n\n  // ── Triage meta (preserved from Merge AI Output) ─────────────────\n  _triage_meta: {\n    ...triageMeta,\n    pipeline_version: PIPELINE_VERSION,\n  },\n\n  // ── Routing meta (full observability) ────────────────────────────\n  _routing_meta: {\n    pipeline_version:          PIPELINE_VERSION,\n    route_tier:                routeTier,\n    priority_score:            priorityScore,\n    notif_priority:            NOTIF_PRIORITY[routeTier] || 'P4',\n    alert_channels:            uniqueChannels,\n    impact_level:              impactLevel,\n    impact_score:              impactScore,\n    confidence:                confidence,\n    competitor_flag:           competitor,\n    is_urgent:                 isUrgent,\n    override_status:           overrideStatus,\n    override_violation:        overrideViolation,\n    override_violation_reason: overrideViolationReason,\n    age_hours:                 computedAgeHours,\n    signal_type:               signalType,\n    db_success:                dbSuccess,\n    ai_processed:              aiProcessed,\n    should_retry_ai:           shouldRetryAI,\n    should_retry_db:           shouldRetryDB,\n    send_daily:                sendDaily,\n    send_weekly:               sendWeekly,\n    signal_velocity:           signalVelocity,\n    velocity_label:            velocityLabel,\n    retry_count_ai:            retryCountAI,\n    retry_count_db:            retryCountSafe,\n    routed_at:                 isoNow(),\n  },\n\n  // ── Audit trail ──────────────────────────────────────────────────\n  _audit: auditEntry,\n};\n\nreturn [{ json: enriched }];\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        0
+      ],
+      "id": "3762e8c6-60bd-48a5-84b7-ed7f7d5c3721",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ============================================================\n * OncoWatch — Format CRITICAL Alert\n * Version: 1.0.0\n * Builds rich Slack Block Kit + Email payload for CRITICAL tier\n * ============================================================\n */\n\nconst s = $input.item.json;\n\nconst isoNow  = () => new Date().toISOString();\nconst safeStr = (v, fb = 'N/A') => (v === null || v === undefined || v === '') ? fb : String(v);\n\n// ── Core signal fields ────────────────────────────────────────\nconst signalId      = safeStr(s.source_id || s.id);\nconst drug          = safeStr(s.key_drug   || s.drug_name);\nconst indication    = safeStr(s.key_indication || s.indication);\nconst sponsor       = safeStr(s.sponsor);\nconst phase         = safeStr(s.phase || s.trial_phase);\nconst trialStatus   = safeStr(s.status || s.trial_status);\nconst impactLevel   = safeStr(s.impact_level, 'HIGH');\nconst impactScore   = s.impact_score ?? 'N/A';\nconst routeTier     = safeStr(s.route_tier);\nconst priorityScore = s.priority_score ?? 'N/A';\nconst notifPriority = safeStr(s.notif_priority, 'P0');\nconst confidence    = s.score_breakdown?.confidence ?? 'N/A';\nconst aiSummary     = safeStr(s.ai_summary);\nconst recAction     = safeStr(s.recommended_action);\nconst signalType    = safeStr(s.signal_type);\nconst competitor    = !!s.competitor_flag;\nconst isUrgent      = !!s.is_urgent;\nconst overrideStatus = safeStr(s.override_status, 'none');\nconst overrideBy    = safeStr(s.override_by, '');\nconst overrideReason = safeStr(s.override_reason, '');\nconst velocityLabel = safeStr(s.velocity_label, 'STABLE');\nconst url           = safeStr(s.url, '');\nconst firstSeenAt   = safeStr(s.first_seen_at, '');\nconst ageHours      = s.age_hours ?? 'N/A';\n\nconst drivers = Array.isArray(s.score_breakdown?.drivers)\n  ? s.score_breakdown.drivers.slice(0, 4).map(d => `• ${d}`).join('\\n')\n  : 'N/A';\n\nconst risks = Array.isArray(s.score_breakdown?.risks)\n  ? s.score_breakdown.risks.slice(0, 3).map(r => `⚠ ${r}`).join('\\n')\n  : 'N/A';\n\nconst alertChannels = Array.isArray(s.alert_channels)\n  ? s.alert_channels.join(', ')\n  : 'N/A';\n\nconst overrideBlock = overrideStatus !== 'none'\n  ? `\\n*Override:* ${overrideStatus.toUpperCase()} by ${overrideBy || 'unknown'}\\n*Reason:* ${overrideReason}`\n  : '';\n\nconst violationBlock = s.override_violation\n  ? `\\n\\n🔴 *OVERRIDE VIOLATION DETECTED*\\n${safeStr(s.override_violation_reason)}`\n  : '';\n\n// ── Slack Block Kit message ───────────────────────────────────\nconst slackBlocks = [\n  {\n    type: 'header',\n    text: {\n      type: 'plain_text',\n      text: `🚨 [${notifPriority}] CRITICAL CI Signal — ${drug}`,\n      emoji: true\n    }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Drug:*\\n${drug}` },\n      { type: 'mrkdwn', text: `*Indication:*\\n${indication}` },\n      { type: 'mrkdwn', text: `*Sponsor:*\\n${sponsor}` },\n      { type: 'mrkdwn', text: `*Phase:*\\n${phase}` },\n      { type: 'mrkdwn', text: `*Trial Status:*\\n${trialStatus}` },\n      { type: 'mrkdwn', text: `*Signal Type:*\\n${signalType}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Impact Level:*\\n${impactLevel}` },\n      { type: 'mrkdwn', text: `*Impact Score:*\\n${impactScore}/10` },\n      { type: 'mrkdwn', text: `*Priority Score:*\\n${priorityScore}/10` },\n      { type: 'mrkdwn', text: `*Confidence:*\\n${typeof confidence === 'number' ? (confidence * 100).toFixed(0) + '%' : confidence}` },\n      { type: 'mrkdwn', text: `*Competitor:*\\n${competitor ? '✅ YES' : '❌ NO'}` },\n      { type: 'mrkdwn', text: `*Urgent:*\\n${isUrgent ? '⚡ YES' : 'NO'}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `*AI Summary:*\\n${aiSummary}`\n    }\n  },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Key Drivers:*\\n${drivers}` },\n      { type: 'mrkdwn', text: `*Risks / Caveats:*\\n${risks}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Recommended Action:*\\n🔴 ${recAction}` },\n      { type: 'mrkdwn', text: `*Signal Velocity:*\\n${velocityLabel}` },\n      { type: 'mrkdwn', text: `*Override Status:*\\n${overrideStatus.toUpperCase()}${overrideBy ? ' by ' + overrideBy : ''}` },\n      { type: 'mrkdwn', text: `*Alert Channels:*\\n${alertChannels}` },\n      { type: 'mrkdwn', text: `*First Seen:*\\n${firstSeenAt}` },\n      { type: 'mrkdwn', text: `*Age:*\\n${ageHours} hrs` }\n    ]\n  },\n  ...(overrideBlock || violationBlock ? [{\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `${overrideBlock}${violationBlock}`\n    }\n  }] : []),\n  ...(url ? [{\n    type: 'actions',\n    elements: [{\n      type: 'button',\n      text: { type: 'plain_text', text: '🔗 View Source', emoji: true },\n      url: url,\n      style: 'primary'\n    }]\n  }] : []),\n  { type: 'divider' },\n  {\n    type: 'context',\n    elements: [{\n      type: 'mrkdwn',\n      text: `OncoWatch • Pipeline v${safeStr(s._triage_meta?.pipeline_version, 'N/A')} • Signal ID: ${signalId} • Routed at: ${isoNow()}`\n    }]\n  }\n];\n\n// ── Plain text fallback (for email) ──────────────────────────\nconst emailSubject = `[${notifPriority}] 🚨 CRITICAL CI Signal: ${drug} — ${indication}`;\n\nconst emailBody = `\nCRITICAL COMPETITIVE INTELLIGENCE SIGNAL\n=========================================\nPriority:        ${notifPriority}\nRoute Tier:      ${routeTier}\nSignal ID:       ${signalId}\n\nDRUG & TRIAL\n─────────────\nDrug:            ${drug}\nIndication:      ${indication}\nSponsor:         ${sponsor}\nPhase:           ${phase}\nTrial Status:    ${trialStatus}\nSignal Type:     ${signalType}\nSource URL:      ${url || 'N/A'}\n\nTRIAGE SCORES\n─────────────\nImpact Level:    ${impactLevel}\nImpact Score:    ${impactScore}/10\nPriority Score:  ${priorityScore}/10\nConfidence:      ${typeof confidence === 'number' ? (confidence * 100).toFixed(0) + '%' : confidence}\nCompetitor Flag: ${competitor ? 'YES' : 'NO'}\nUrgent:          ${isUrgent ? 'YES' : 'NO'}\nVelocity:        ${velocityLabel}\n\nAI SUMMARY\n──────────\n${aiSummary}\n\nKEY DRIVERS\n───────────\n${drivers}\n\nRISKS / CAVEATS\n───────────────\n${risks}\n\nRECOMMENDED ACTION: ${recAction}\n\nOVERRIDE\n─────────\nStatus:   ${overrideStatus.toUpperCase()}\nBy:       ${overrideBy || 'N/A'}\nReason:   ${overrideReason || 'N/A'}\nViolation: ${s.override_violation ? 'YES — ' + safeStr(s.override_violation_reason) : 'NO'}\n\nMETADATA\n─────────\nFirst Seen:    ${firstSeenAt}\nAge:           ${ageHours} hrs\nAlert Channels: ${alertChannels}\nPipeline:      v${safeStr(s._triage_meta?.pipeline_version, 'N/A')}\n`.trim();\n\n// ── Postgres audit row ────────────────────────────────────────\nconst auditRow = {\n  signal_id:        signalId,\n  route_tier:       routeTier,\n  notif_priority:   notifPriority,\n  impact_level:     impactLevel,\n  impact_score:     s.impact_score ?? null,\n  priority_score:   s.priority_score ?? null,\n  confidence:       typeof confidence === 'number' ? confidence : null,\n  competitor_flag:  competitor,\n  is_urgent:        isUrgent,\n  override_status:  overrideStatus,\n  override_violation: !!s.override_violation,\n  recommended_action: recAction,\n  signal_type:      signalType,\n  alert_channels:   JSON.stringify(s.alert_channels || []),\n  velocity_label:   velocityLabel,\n  ai_summary:       aiSummary,\n  routed_at:        isoNow(),\n  pipeline_version: safeStr(s._triage_meta?.pipeline_version, 'N/A'),\n};\n\nreturn [{\n  json: {\n    ...s,\n    _alert: {\n      slack_blocks:  slackBlocks,\n      email_subject: emailSubject,\n      email_body:    emailBody,\n      audit_row:     auditRow,\n      formatted_at:  isoNow(),\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2032,
+        -1600
+      ],
+      "id": "899544bb-6d3f-4464-b04a-e8f709e1f9eb",
+      "name": "Format CRITICAL Alert"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#exec-alerts",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json._alert.slack_blocks) }}",
+        "text": "={{ $json._alert.email_subject }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        2448,
+        -1312
+      ],
+      "id": "396c5869-8a5c-49f5-b069-1e92ee6e9711",
+      "name": "Slack Exec Alert",
+      "webhookId": "f1037c81-9192-403e-8f55-29ce1f1eba81",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#medical_affair_ci",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json._alert.slack_blocks) }}",
+        "text": "={{ $json._alert.email_subject }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        2560,
+        -1504
+      ],
+      "id": "15a52ea4-9e16-4b99-9dd8-ef52e6d9e05c",
+      "name": "Slack Medical Affairs",
+      "webhookId": "f1037c81-9192-403e-8f55-29ce1f1eba81",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nfor (const item of $input.all()) {\n  item.json.myNewField = 1;\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        -1312
+      ],
+      "id": "01d9965f-380c-4588-80e7-206a62865b80",
+      "name": "Format HIGH_COMPETITOR Alert"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch_ci_team",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json._alert.slack_blocks) }}",
+        "text": "={{ $json._alert.email_subject }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        2144,
+        -1376
+      ],
+      "id": "f6cdb541-d9b5-45da-b146-0a28e6222484",
+      "name": "Slack CI Team",
+      "webhookId": "081c1fc2-0350-4a6a-bc21-9aaff8c9eaa7",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_audit_log (\n  signal_id,\n  route_tier,\n  notif_priority,\n  impact_level,\n  impact_score,\n  priority_score,\n  confidence,\n  competitor_flag,\n  is_urgent,\n  override_status,\n  override_violation,\n  recommended_action,\n  signal_type,\n  alert_channels,\n  velocity_label,\n  ai_summary,\n  pipeline_version,\n  routed_at\n)\nVALUES (\n  $1, $2, $3, $4, $5, $6, $7, $8, $9,\n  $10, $11, $12, $13, $14, $15, $16, $17, $18\n)\nON CONFLICT DO NOTHING\nRETURNING id, signal_id, route_tier, routed_at;\n",
+        "options": {
+          "queryReplacement": "={{  [    $json._alert.audit_row.signal_id,    $json._alert.audit_row.route_tier,    $json._alert.audit_row.notif_priority,    $json._alert.audit_row.impact_level,    $json._alert.audit_row.impact_score,    $json._alert.audit_row.priority_score,    $json._alert.audit_row.confidence,    $json._alert.audit_row.competitor_flag,    $json.is_urgent,    $json._alert.audit_row.override_status,    $json._alert.audit_row.override_violation,    $json._alert.audit_row.recommended_action,    $json._alert.audit_row.signal_type,    $json._alert.audit_row.alert_channels,    $json._alert.audit_row.velocity_label,    $json._alert.audit_row.ai_summary,    $json._alert.audit_row.pipeline_version,    $json._alert.audit_row.routed_at  ]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2144,
+        -1024
+      ],
+      "id": "212cb220-fa27-44bc-84ca-8a27b9322ffd",
+      "name": "Postgres Audit Log",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_audit_log (\n  signal_id,\n  route_tier,\n  notif_priority,\n  impact_level,\n  impact_score,\n  priority_score,\n  confidence,\n  competitor_flag,\n  is_urgent,\n  override_status,\n  override_violation,\n  recommended_action,\n  signal_type,\n  alert_channels,\n  velocity_label,\n  ai_summary,\n  pipeline_version,\n  routed_at\n)\nVALUES (\n  $1, $2, $3, $4, $5, $6, $7, $8, $9,\n  $10, $11, $12, $13, $14, $15, $16, $17, $18\n)\nON CONFLICT DO NOTHING\nRETURNING id, signal_id, route_tier, routed_at;\n",
+        "options": {
+          "queryReplacement": "={{  [    $json._alert.audit_row.signal_id,    $json._alert.audit_row.route_tier,    $json._alert.audit_row.notif_priority,    $json._alert.audit_row.impact_level,    $json._alert.audit_row.impact_score,    $json._alert.audit_row.priority_score,    $json._alert.audit_row.confidence,    $json._alert.audit_row.competitor_flag,    $json.is_urgent,    $json._alert.audit_row.override_status,    $json._alert.audit_row.override_violation,    $json._alert.audit_row.recommended_action,    $json._alert.audit_row.signal_type,    $json._alert.audit_row.alert_channels,    $json._alert.audit_row.velocity_label,    $json._alert.audit_row.ai_summary,    $json._alert.audit_row.pipeline_version,    $json._alert.audit_row.routed_at  ]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2384,
+        -1664
+      ],
+      "id": "4bcd77d2-3e0e-487f-863a-7dd8e9c79d0f",
+      "name": "Postgres Audit Log1",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "jainakshatsunil@gmail.com",
+        "subject": "={{ $json._alert.email_subject }}",
+        "message": "={{  (() => {    const s = $json;    const a = s._alert || {};    const score = s.impact_score ?? 'N/A';    const priority = s.priority_score ?? 'N/A';    const conf = typeof s.score_breakdown?.confidence === 'number'      ? (s.score_breakdown.confidence * 100).toFixed(0) + '%'      : 'N/A';    const drivers = Array.isArray(s.score_breakdown?.drivers)      ? s.score_breakdown.drivers.map(d => `<li>${d}</li>`).join('')      : '<li>N/A</li>';    const risks = Array.isArray(s.score_breakdown?.risks)      ? s.score_breakdown.risks.map(r => `<li>${r}</li>`).join('')      : '<li>N/A</li>';    const urlBtn = s.url      ? `<a href=\"${s.url}\" style=\"background:#c0392b;color:#fff;padding:10px 20px;border-radius:5px;text-decoration:none;font-weight:bold;\">🔗 View Source</a>`      : '';    const overrideBlock = s.override_status !== 'none'      ? `<tr><td style=\"padding:8px;background:#fff3cd;border-radius:4px;\" colspan=\"2\">           <b>⚠ Override:</b> ${s.override_status?.toUpperCase()} by ${s.override_by || 'unknown'}<br/>           <b>Reason:</b> ${s.override_reason || 'N/A'}         </td></tr>`      : '';    const violationBlock = s.override_violation      ? `<tr><td colspan=\"2\" style=\"padding:8px;background:#f8d7da;border-radius:4px;color:#721c24;\">           <b>🔴 OVERRIDE VIOLATION:</b> ${s.override_violation_reason || ''}         </td></tr>`      : '';    return `<!DOCTYPE html><html><head>  <style>    body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }    .container { max-width: 680px; margin: 30px auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }    .header { background: #c0392b; color: #fff; padding: 24px 32px; }    .header h1 { margin: 0; font-size: 22px; }    .header p { margin: 6px 0 0; font-size: 13px; opacity: 0.85; }    .badge { display: inline-block; background: #fff; color: #c0392b; font-weight: bold; font-size: 13px; padding: 3px 10px; border-radius: 20px; margin-bottom: 8px; }    .body { padding: 28px 32px; }    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }    td { padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #eee; vertical-align: top; }    td:first-child { font-weight: bold; color: #555; width: 40%; }    .section-title { font-size: 15px; font-weight: bold; color: #c0392b; margin: 20px 0 8px; border-left: 4px solid #c0392b; padding-left: 10px; }    .summary-box { background: #fff5f5; border-left: 4px solid #c0392b; padding: 14px 16px; border-radius: 4px; font-size: 14px; line-height: 1.6; margin-bottom: 20px; }    ul { margin: 0; padding-left: 18px; font-size: 14px; line-height: 1.8; }    .footer { background: #f9f9f9; padding: 16px 32px; font-size: 12px; color: #888; border-top: 1px solid #eee; }    .cta { text-align: center; padding: 20px 0; }  </style></head><body><div class=\"container\">  <!-- Header -->  <div class=\"header\">    <div class=\"badge\">🚨 ${s.notif_priority || 'P0'} — CRITICAL</div>    <h1>${s.key_drug || s.drug_name || 'Unknown Drug'} — ${s.key_indication || s.indication || 'Unknown Indication'}</h1>    <p>OncoWatch Competitive Intelligence Alert • ${new Date().toUTCString()}</p>  </div>  <div class=\"body\">    <!-- Signal Details -->    <div class=\"section-title\">Signal Details</div>    <table>      <tr><td>Signal ID</td><td>${s.source_id || s.id || 'N/A'}</td></tr>      <tr><td>Drug</td><td>${s.key_drug || s.drug_name || 'N/A'}</td></tr>      <tr><td>Indication</td><td>${s.key_indication || s.indication || 'N/A'}</td></tr>      <tr><td>Sponsor</td><td>${s.sponsor || 'N/A'}</td></tr>      <tr><td>Phase</td><td>${s.phase || s.trial_phase || 'N/A'}</td></tr>      <tr><td>Trial Status</td><td>${s.status || s.trial_status || 'N/A'}</td></tr>      <tr><td>Signal Type</td><td>${s.signal_type || 'N/A'}</td></tr>      <tr><td>Source URL</td><td>${s.url ? `<a href=\"${s.url}\">${s.url}</a>` : 'N/A'}</td></tr>    </table>    <!-- Triage Scores -->    <div class=\"section-title\">Triage Scores</div>    <table>      <tr><td>Impact Level</td><td><b style=\"color:#c0392b\">${s.impact_level || 'N/A'}</b></td></tr>      <tr><td>Impact Score</td><td>${score}/10</td></tr>      <tr><td>Priority Score</td><td>${priority}/10</td></tr>      <tr><td>Confidence</td><td>${conf}</td></tr>      <tr><td>Route Tier</td><td>${s.route_tier || 'N/A'}</td></tr>      <tr><td>Competitor Flag</td><td>${s.competitor_flag ? '✅ YES' : '❌ NO'}</td></tr>      <tr><td>Urgent</td><td>${s.is_urgent ? '⚡ YES' : 'NO'}</td></tr>      <tr><td>Signal Velocity</td><td>${s.velocity_label || 'N/A'}</td></tr>      ${overrideBlock}      ${violationBlock}    </table>    <!-- AI Summary -->    <div class=\"section-title\">AI Summary</div>    <div class=\"summary-box\">${s.ai_summary || 'No summary available.'}</div>    <!-- Drivers -->    <div class=\"section-title\">Key Drivers</div>    <ul>${drivers}</ul>    <!-- Risks -->    <div class=\"section-title\">Risks / Caveats</div>    <ul>${risks}</ul>    <!-- Recommended Action -->    <div class=\"section-title\">Recommended Action</div>    <p style=\"font-size:16px;font-weight:bold;color:#c0392b;\">🔴 ${s.recommended_action || 'N/A'}</p>    <!-- CTA Button -->    ${urlBtn ? `<div class=\"cta\">${urlBtn}</div>` : ''}  </div>  <!-- Footer -->  <div class=\"footer\">    OncoWatch CI Pipeline • Pipeline v${s._triage_meta?.pipeline_version || 'N/A'} •    Signal ID: ${s.source_id || s.id || 'N/A'} •    Alert Channels: ${(s.alert_channels || []).join(', ') || 'N/A'}  </div></div></body></html>    `.trim();  })()}}",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "={{ JSON.stringify($json._alert.audit_row, null, 2) }}"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2144,
+        -1216
+      ],
+      "id": "b0e2face-1e86-42ef-a321-106815ce69d6",
+      "name": "Email CI Team",
+      "webhookId": "cfea2fe2-744e-4808-805e-4b89d4c5303e",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "hcMRdhNwyO3ts9Da",
+          "name": "OncoWatch Gmail"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "jainakshatsunil@gmail.com",
+        "subject": "={{ $json._alert.email_subject }}",
+        "message": "={{\n  (() => {\n    const s = $json || {};\n    const score = s.impact_score ?? 'N/A';\n    const priority = s.priority_score ?? 'N/A';\n    const conf = typeof s.score_breakdown?.confidence === 'number'\n      ? (s.score_breakdown.confidence * 100).toFixed(0) + '%'\n      : 'N/A';\n\n    const drivers = Array.isArray(s.score_breakdown?.drivers)\n      ? s.score_breakdown.drivers.map(d => `<li>${d}</li>`).join('')\n      : '<li>N/A</li>';\n\n    const risks = Array.isArray(s.score_breakdown?.risks)\n      ? s.score_breakdown.risks.map(r => `<li>${r}</li>`).join('')\n      : '<li>N/A</li>';\n\n    const urlBtn = s.url\n      ? `<a href=\"${s.url}\" style=\"background:#c0392b;color:#fff;padding:10px 20px;border-radius:5px;text-decoration:none;font-weight:bold;\">🔗 View Source</a>`\n      : '';\n\n    const overrideBlock = s.override_status && s.override_status !== 'none'\n      ? `<tr><td style=\"padding:8px;background:#fff3cd;border-radius:4px;\" colspan=\"2\">\n           <b>⚠ Override:</b> ${String(s.override_status).toUpperCase()} by ${s.override_by || 'unknown'}<br/>\n           <b>Reason:</b> ${s.override_reason || 'N/A'}\n         </td></tr>`\n      : '';\n\n    const violationBlock = s.override_violation\n      ? `<tr><td colspan=\"2\" style=\"padding:8px;background:#f8d7da;border-radius:4px;color:#721c24;\">\n           <b>🔴 OVERRIDE VIOLATION:</b> ${s.override_violation_reason || ''}\n         </td></tr>`\n      : '';\n\n    const html = `\n<!DOCTYPE html>\n<html>\n<head>\n  <style>\n    body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }\n    .container { max-width: 680px; margin: 30px auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }\n    .header { background: #c0392b; color: #fff; padding: 24px 32px; }\n    .header h1 { margin: 0; font-size: 22px; }\n    .header p { margin: 6px 0 0; font-size: 13px; opacity: 0.85; }\n    .badge { display: inline-block; background: #fff; color: #c0392b; font-weight: bold; font-size: 13px; padding: 3px 10px; border-radius: 20px; margin-bottom: 8px; }\n    .body { padding: 28px 32px; }\n    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }\n    td { padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #eee; vertical-align: top; }\n    td:first-child { font-weight: bold; color: #555; width: 40%; }\n    .section-title { font-size: 15px; font-weight: bold; color: #c0392b; margin: 20px 0 8px; border-left: 4px solid #c0392b; padding-left: 10px; }\n    .summary-box { background: #fff5f5; border-left: 4px solid #c0392b; padding: 14px 16px; border-radius: 4px; font-size: 14px; line-height: 1.6; margin-bottom: 20px; }\n    ul { margin: 0; padding-left: 18px; font-size: 14px; line-height: 1.8; }\n    .footer { background: #f9f9f9; padding: 16px 32px; font-size: 12px; color: #888; border-top: 1px solid #eee; }\n    .cta { text-align: center; padding: 20px 0; }\n  </style>\n</head>\n<body>\n<div class=\"container\">\n\n  <div class=\"header\">\n    <div class=\"badge\">🚨 ${s.notif_priority || 'P0'} — CRITICAL</div>\n    <h1>${s.key_drug || s.drug_name || 'Unknown Drug'} — ${s.key_indication || s.indication || 'Unknown Indication'}</h1>\n    <p>OncoWatch Competitive Intelligence Alert • ${new Date().toUTCString()}</p>\n  </div>\n\n  <div class=\"body\">\n\n    <div class=\"section-title\">Signal Details</div>\n    <table>\n      <tr><td>Signal ID</td><td>${s.source_id || s.id || 'N/A'}</td></tr>\n      <tr><td>Drug</td><td>${s.key_drug || s.drug_name || 'N/A'}</td></tr>\n      <tr><td>Indication</td><td>${s.key_indication || s.indication || 'N/A'}</td></tr>\n      <tr><td>Sponsor</td><td>${s.sponsor || 'N/A'}</td></tr>\n      <tr><td>Phase</td><td>${s.phase || s.trial_phase || 'N/A'}</td></tr>\n      <tr><td>Trial Status</td><td>${s.status || s.trial_status || 'N/A'}</td></tr>\n      <tr><td>Signal Type</td><td>${s.signal_type || 'N/A'}</td></tr>\n      <tr><td>Source URL</td><td>${s.url ? `<a href=\"${s.url}\">${s.url}</a>` : 'N/A'}</td></tr>\n    </table>\n\n    <div class=\"section-title\">Triage Scores</div>\n    <table>\n      <tr><td>Impact Level</td><td><b style=\"color:#c0392b\">${s.impact_level || 'N/A'}</b></td></tr>\n      <tr><td>Impact Score</td><td>${score}/10</td></tr>\n      <tr><td>Priority Score</td><td>${priority}/10</td></tr>\n      <tr><td>Confidence</td><td>${conf}</td></tr>\n      <tr><td>Route Tier</td><td>${s.route_tier || 'N/A'}</td></tr>\n      <tr><td>Competitor Flag</td><td>${s.competitor_flag ? '✅ YES' : '❌ NO'}</td></tr>\n      <tr><td>Urgent</td><td>${s.is_urgent ? '⚡ YES' : 'NO'}</td></tr>\n      <tr><td>Signal Velocity</td><td>${s.velocity_label || 'N/A'}</td></tr>\n      ${overrideBlock}\n      ${violationBlock}\n    </table>\n\n    <div class=\"section-title\">AI Summary</div>\n    <div class=\"summary-box\">${s.ai_summary || 'No summary available.'}</div>\n\n    <div class=\"section-title\">Key Drivers</div>\n    <ul>${drivers}</ul>\n\n    <div class=\"section-title\">Risks / Caveats</div>\n    <ul>${risks}</ul>\n\n    <div class=\"section-title\">Recommended Action</div>\n    <p style=\"font-size:16px;font-weight:bold;color:#c0392b;\">🔴 ${s.recommended_action || 'N/A'}</p>\n\n    ${urlBtn ? `<div class=\"cta\">${urlBtn}</div>` : ''}\n\n  </div>\n\n  <div class=\"footer\">\n    OncoWatch CI Pipeline • Pipeline v${s._triage_meta?.pipeline_version || 'N/A'} •\n    Signal ID: ${s.source_id || s.id || 'N/A'} •\n    Alert Channels: ${(s.alert_channels || []).join(', ') || 'N/A'}\n  </div>\n\n</div>\n</body>\n</html>\n    `;\n\n    return String(html).trim();\n  })()\n}}\n\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2304,
+        -1824
+      ],
+      "id": "9c8e284a-42e1-4255-801e-17316b7a41ac",
+      "name": "Email Executive",
+      "webhookId": "179ffeaf-a390-4be3-a308-c6ad9dc0f860",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "hcMRdhNwyO3ts9Da",
+          "name": "OncoWatch Gmail"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ============================================================\n * OncoWatch — Format HIGH Alert\n * Version: 1.0.0\n * Builds Slack Block Kit + Email for HIGH tier signals\n * ============================================================\n */\n\nconst s = $input.item.json;\nconst isoNow  = () => new Date().toISOString();\nconst safeStr = (v, fb = 'N/A') =>\n  (v === null || v === undefined || v === '') ? fb : String(v);\n\n// ── Core fields ───────────────────────────────────────────────\nconst signalId      = safeStr(s.source_id || s.id);\nconst drug          = safeStr(s.key_drug  || s.drug_name);\nconst indication    = safeStr(s.key_indication || s.indication);\nconst sponsor       = safeStr(s.sponsor);\nconst phase         = safeStr(s.phase || s.trial_phase);\nconst trialStatus   = safeStr(s.status || s.trial_status);\nconst signalType    = safeStr(s.signal_type);\nconst impactLevel   = safeStr(s.impact_level, 'HIGH');\nconst impactScore   = s.impact_score   ?? 'N/A';\nconst priorityScore = s.priority_score ?? 'N/A';\nconst notifPriority = safeStr(s.notif_priority, 'P1');\nconst routeTier     = safeStr(s.route_tier);\nconst recAction     = safeStr(s.recommended_action);\nconst aiSummary     = safeStr(s.ai_summary);\nconst competitor    = !!s.competitor_flag;\nconst isUrgent      = !!s.is_urgent;\nconst velocityLabel = safeStr(s.velocity_label, 'STABLE');\nconst overrideStatus = safeStr(s.override_status, 'none');\nconst overrideBy    = safeStr(s.override_by, '');\nconst overrideReason = safeStr(s.override_reason, '');\nconst url           = safeStr(s.url, '');\nconst firstSeenAt   = safeStr(s.first_seen_at, '');\nconst ageHours      = s.age_hours ?? 'N/A';\nconst confidence    = s.score_breakdown?.confidence ?? 'N/A';\n\nconst alertChannels = Array.isArray(s.alert_channels)\n  ? s.alert_channels.join(', ') : 'N/A';\n\nconst drivers = Array.isArray(s.score_breakdown?.drivers)\n  ? s.score_breakdown.drivers.slice(0, 4).map(d => `• ${d}`).join('\\n')\n  : 'N/A';\n\nconst risks = Array.isArray(s.score_breakdown?.risks)\n  ? s.score_breakdown.risks.slice(0, 3).map(r => `⚠ ${r}`).join('\\n')\n  : 'N/A';\n\nconst confDisplay = typeof confidence === 'number'\n  ? (confidence * 100).toFixed(0) + '%'\n  : confidence;\n\nconst overrideBlock = overrideStatus !== 'none'\n  ? `\\n*Override:* ${overrideStatus.toUpperCase()} by ${overrideBy || 'unknown'}\\n*Reason:* ${overrideReason}`\n  : '';\n\nconst violationBlock = s.override_violation\n  ? `\\n\\n🔴 *OVERRIDE VIOLATION:*\\n${safeStr(s.override_violation_reason)}`\n  : '';\n\n// ── Slack Block Kit ───────────────────────────────────────────\nconst slackBlocks = [\n  {\n    type: 'header',\n    text: {\n      type: 'plain_text',\n      text: `🔴 [${notifPriority}] HIGH Signal — ${drug}`,\n      emoji: true\n    }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Drug:*\\n${drug}` },\n      { type: 'mrkdwn', text: `*Indication:*\\n${indication}` },\n      { type: 'mrkdwn', text: `*Sponsor:*\\n${sponsor}` },\n      { type: 'mrkdwn', text: `*Phase:*\\n${phase}` },\n      { type: 'mrkdwn', text: `*Trial Status:*\\n${trialStatus}` },\n      { type: 'mrkdwn', text: `*Signal Type:*\\n${signalType}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Impact Level:*\\n🔴 ${impactLevel}` },\n      { type: 'mrkdwn', text: `*Impact Score:*\\n${impactScore}/10` },\n      { type: 'mrkdwn', text: `*Priority Score:*\\n${priorityScore}/10` },\n      { type: 'mrkdwn', text: `*Confidence:*\\n${confDisplay}` },\n      { type: 'mrkdwn', text: `*Competitor:*\\n${competitor ? '✅ YES' : '❌ NO'}` },\n      { type: 'mrkdwn', text: `*Urgent:*\\n${isUrgent ? '⚡ YES' : 'NO'}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `*AI Summary:*\\n${aiSummary}`\n    }\n  },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Key Drivers:*\\n${drivers}` },\n      { type: 'mrkdwn', text: `*Risks / Caveats:*\\n${risks}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Recommended Action:*\\n🔴 ${recAction}` },\n      { type: 'mrkdwn', text: `*Signal Velocity:*\\n${velocityLabel}` },\n      { type: 'mrkdwn', text: `*Override:*\\n${overrideStatus.toUpperCase()}${overrideBy ? ' by ' + overrideBy : ''}` },\n      { type: 'mrkdwn', text: `*Alert Channels:*\\n${alertChannels}` },\n      { type: 'mrkdwn', text: `*First Seen:*\\n${firstSeenAt}` },\n      { type: 'mrkdwn', text: `*Age:*\\n${ageHours} hrs` }\n    ]\n  },\n  ...(overrideBlock || violationBlock ? [{\n    type: 'section',\n    text: { type: 'mrkdwn', text: `${overrideBlock}${violationBlock}` }\n  }] : []),\n  ...(url ? [{\n    type: 'actions',\n    elements: [{\n      type: 'button',\n      text: { type: 'plain_text', text: '🔗 View Source', emoji: true },\n      url: url,\n      style: 'primary'\n    }]\n  }] : []),\n  { type: 'divider' },\n  {\n    type: 'context',\n    elements: [{\n      type: 'mrkdwn',\n      text: `OncoWatch • Pipeline v${safeStr(s._triage_meta?.pipeline_version, 'N/A')} • Signal ID: ${signalId} • Routed at: ${isoNow()}`\n    }]\n  }\n];\n\n// ── Email ─────────────────────────────────────────────────────\nconst emailSubject =\n  `[${notifPriority}] 🔴 HIGH CI Signal: ${drug} — ${indication}`;\n\nconst emailBody = `\nHIGH IMPACT COMPETITIVE INTELLIGENCE SIGNAL\n============================================\nPriority:        ${notifPriority}\nRoute Tier:      ${routeTier}\nSignal ID:       ${signalId}\n\nDRUG & TRIAL\n─────────────\nDrug:            ${drug}\nIndication:      ${indication}\nSponsor:         ${sponsor}\nPhase:           ${phase}\nTrial Status:    ${trialStatus}\nSignal Type:     ${signalType}\nSource URL:      ${url || 'N/A'}\n\nTRIAGE SCORES\n─────────────\nImpact Level:    ${impactLevel}\nImpact Score:    ${impactScore}/10\nPriority Score:  ${priorityScore}/10\nConfidence:      ${confDisplay}\nCompetitor Flag: ${competitor ? 'YES' : 'NO'}\nUrgent:          ${isUrgent ? 'YES' : 'NO'}\nVelocity:        ${velocityLabel}\n\nAI SUMMARY\n──────────\n${aiSummary}\n\nKEY DRIVERS\n───────────\n${drivers}\n\nRISKS / CAVEATS\n───────────────\n${risks}\n\nRECOMMENDED ACTION: ${recAction}\n\nOVERRIDE\n─────────\nStatus:    ${overrideStatus.toUpperCase()}\nBy:        ${overrideBy   || 'N/A'}\nReason:    ${overrideReason || 'N/A'}\nViolation: ${s.override_violation ? 'YES — ' + safeStr(s.override_violation_reason) : 'NO'}\n\nMETADATA\n─────────\nFirst Seen:     ${firstSeenAt}\nAge:            ${ageHours} hrs\nAlert Channels: ${alertChannels}\nPipeline:       v${safeStr(s._triage_meta?.pipeline_version, 'N/A')}\n`.trim();\n\n// ── Audit row ─────────────────────────────────────────────────\nconst auditRow = {\n  signal_id:          signalId,\n  route_tier:         routeTier,\n  notif_priority:     notifPriority,\n  impact_level:       impactLevel,\n  impact_score:       s.impact_score      ?? null,\n  priority_score:     s.priority_score    ?? null,\n  confidence:         typeof confidence === 'number' ? confidence : null,\n  competitor_flag:    competitor,\n  is_urgent:          isUrgent,\n  override_status:    overrideStatus,\n  override_violation: !!s.override_violation,\n  recommended_action: recAction,\n  signal_type:        signalType,\n  alert_channels:     JSON.stringify(s.alert_channels || []),\n  velocity_label:     velocityLabel,\n  ai_summary:         aiSummary,\n  pipeline_version:   safeStr(s._triage_meta?.pipeline_version, 'N/A'),\n  routed_at:          isoNow(),\n};\n\nreturn [{\n  json: {\n    ...s,\n    _alert: {\n      slack_blocks:  slackBlocks,\n      email_subject: emailSubject,\n      email_body:    emailBody,\n      audit_row:     auditRow,\n      formatted_at:  isoNow(),\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2032,
+        -784
+      ],
+      "id": "cbc74f25-19a7-43a1-9449-9257c67be896",
+      "name": "Format HIGH Alert"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#medical_affair_ci",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json._alert.slack_blocks) }}",
+        "text": "={{ $json._alert.email_subject }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        2304,
+        -800
+      ],
+      "id": "52effaa1-4f17-4003-b921-301684112621",
+      "name": "Slack Medical Affairs1",
+      "webhookId": "081c1fc2-0350-4a6a-bc21-9aaff8c9eaa7",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "jainakshatsunil@gmail.com",
+        "subject": "={{ $json._alert.email_subject }}",
+        "message": "={{\n  (() => {\n    const s = $json;\n    const a = s._alert || {};\n    const score = s.impact_score ?? 'N/A';\n    const priority = s.priority_score ?? 'N/A';\n    const conf = typeof s.score_breakdown?.confidence === 'number'\n      ? (s.score_breakdown.confidence * 100).toFixed(0) + '%'\n      : 'N/A';\n\n    const drivers = Array.isArray(s.score_breakdown?.drivers)\n      ? s.score_breakdown.drivers.map(d => `<li>${d}</li>`).join('')\n      : '<li>N/A</li>';\n\n    const risks = Array.isArray(s.score_breakdown?.risks)\n      ? s.score_breakdown.risks.map(r => `<li>${r}</li>`).join('')\n      : '<li>N/A</li>';\n\n    const urlBtn = s.url\n      ? `<a href=\"${s.url}\" style=\"background:#c0392b;color:#fff;padding:10px 20px;border-radius:5px;text-decoration:none;font-weight:bold;\">🔗 View Source</a>`\n      : '';\n\n    const overrideBlock = s.override_status !== 'none'\n      ? `<tr><td style=\"padding:8px;background:#fff3cd;border-radius:4px;\" colspan=\"2\">\n           <b>⚠ Override:</b> ${s.override_status?.toUpperCase()} by ${s.override_by || 'unknown'}<br/>\n           <b>Reason:</b> ${s.override_reason || 'N/A'}\n         </td></tr>`\n      : '';\n\n    const violationBlock = s.override_violation\n      ? `<tr><td colspan=\"2\" style=\"padding:8px;background:#f8d7da;border-radius:4px;color:#721c24;\">\n           <b>🔴 OVERRIDE VIOLATION:</b> ${s.override_violation_reason || ''}\n         </td></tr>`\n      : '';\n\n    return `\n<!DOCTYPE html>\n<html>\n<head>\n  <style>\n    body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }\n    .container { max-width: 680px; margin: 30px auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }\n    .header { background: #c0392b; color: #fff; padding: 24px 32px; }\n    .header h1 { margin: 0; font-size: 22px; }\n    .header p { margin: 6px 0 0; font-size: 13px; opacity: 0.85; }\n    .badge { display: inline-block; background: #fff; color: #c0392b; font-weight: bold; font-size: 13px; padding: 3px 10px; border-radius: 20px; margin-bottom: 8px; }\n    .body { padding: 28px 32px; }\n    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }\n    td { padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #eee; vertical-align: top; }\n    td:first-child { font-weight: bold; color: #555; width: 40%; }\n    .section-title { font-size: 15px; font-weight: bold; color: #c0392b; margin: 20px 0 8px; border-left: 4px solid #c0392b; padding-left: 10px; }\n    .summary-box { background: #fff5f5; border-left: 4px solid #c0392b; padding: 14px 16px; border-radius: 4px; font-size: 14px; line-height: 1.6; margin-bottom: 20px; }\n    ul { margin: 0; padding-left: 18px; font-size: 14px; line-height: 1.8; }\n    .footer { background: #f9f9f9; padding: 16px 32px; font-size: 12px; color: #888; border-top: 1px solid #eee; }\n    .cta { text-align: center; padding: 20px 0; }\n  </style>\n</head>\n<body>\n<div class=\"container\">\n\n  <!-- Header -->\n  <div class=\"header\">\n    <div class=\"badge\">🚨 ${s.notif_priority || 'P0'} — CRITICAL</div>\n    <h1>${s.key_drug || s.drug_name || 'Unknown Drug'} — ${s.key_indication || s.indication || 'Unknown Indication'}</h1>\n    <p>OncoWatch Competitive Intelligence Alert • ${new Date().toUTCString()}</p>\n  </div>\n\n  <div class=\"body\">\n\n    <!-- Signal Details -->\n    <div class=\"section-title\">Signal Details</div>\n    <table>\n      <tr><td>Signal ID</td><td>${s.source_id || s.id || 'N/A'}</td></tr>\n      <tr><td>Drug</td><td>${s.key_drug || s.drug_name || 'N/A'}</td></tr>\n      <tr><td>Indication</td><td>${s.key_indication || s.indication || 'N/A'}</td></tr>\n      <tr><td>Sponsor</td><td>${s.sponsor || 'N/A'}</td></tr>\n      <tr><td>Phase</td><td>${s.phase || s.trial_phase || 'N/A'}</td></tr>\n      <tr><td>Trial Status</td><td>${s.status || s.trial_status || 'N/A'}</td></tr>\n      <tr><td>Signal Type</td><td>${s.signal_type || 'N/A'}</td></tr>\n      <tr><td>Source URL</td><td>${s.url ? `<a href=\"${s.url}\">${s.url}</a>` : 'N/A'}</td></tr>\n    </table>\n\n    <!-- Triage Scores -->\n    <div class=\"section-title\">Triage Scores</div>\n    <table>\n      <tr><td>Impact Level</td><td><b style=\"color:#c0392b\">${s.impact_level || 'N/A'}</b></td></tr>\n      <tr><td>Impact Score</td><td>${score}/10</td></tr>\n      <tr><td>Priority Score</td><td>${priority}/10</td></tr>\n      <tr><td>Confidence</td><td>${conf}</td></tr>\n      <tr><td>Route Tier</td><td>${s.route_tier || 'N/A'}</td></tr>\n      <tr><td>Competitor Flag</td><td>${s.competitor_flag ? '✅ YES' : '❌ NO'}</td></tr>\n      <tr><td>Urgent</td><td>${s.is_urgent ? '⚡ YES' : 'NO'}</td></tr>\n      <tr><td>Signal Velocity</td><td>${s.velocity_label || 'N/A'}</td></tr>\n      ${overrideBlock}\n      ${violationBlock}\n    </table>\n\n    <!-- AI Summary -->\n    <div class=\"section-title\">AI Summary</div>\n    <div class=\"summary-box\">${s.ai_summary || 'No summary available.'}</div>\n\n    <!-- Drivers -->\n    <div class=\"section-title\">Key Drivers</div>\n    <ul>${drivers}</ul>\n\n    <!-- Risks -->\n    <div class=\"section-title\">Risks / Caveats</div>\n    <ul>${risks}</ul>\n\n    <!-- Recommended Action -->\n    <div class=\"section-title\">Recommended Action</div>\n    <p style=\"font-size:16px;font-weight:bold;color:#c0392b;\">🔴 ${s.recommended_action || 'N/A'}</p>\n\n    <!-- CTA Button -->\n    ${urlBtn ? `<div class=\"cta\">${urlBtn}</div>` : ''}\n\n  </div>\n\n  <!-- Footer -->\n  <div class=\"footer\">\n    OncoWatch CI Pipeline • Pipeline v${s._triage_meta?.pipeline_version || 'N/A'} •\n    Signal ID: ${s.source_id || s.id || 'N/A'} •\n    Alert Channels: ${(s.alert_channels || []).join(', ') || 'N/A'}\n  </div>\n\n</div>\n</body>\n</html>\n    `.trim();\n  })()\n}}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2320,
+        -608
+      ],
+      "id": "176e25a8-b8b4-44bc-adce-ca26c17bb410",
+      "name": "Email Medical Affairs",
+      "webhookId": "179ffeaf-a390-4be3-a308-c6ad9dc0f860",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "hcMRdhNwyO3ts9Da",
+          "name": "OncoWatch Gmail"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_audit_log (\n  signal_id,\n  route_tier,\n  notif_priority,\n  impact_level,\n  impact_score,\n  priority_score,\n  confidence,\n  competitor_flag,\n  is_urgent,\n  override_status,\n  override_violation,\n  recommended_action,\n  signal_type,\n  alert_channels,\n  velocity_label,\n  ai_summary,\n  pipeline_version,\n  routed_at\n)\nVALUES (\n  $1, $2, $3, $4, $5, $6, $7, $8, $9,\n  $10, $11, $12, $13, $14, $15, $16, $17, $18\n)\nON CONFLICT DO NOTHING\nRETURNING id, signal_id, route_tier, routed_at;\n",
+        "options": {
+          "queryReplacement": "={{  [    $json._alert.audit_row.signal_id,    $json._alert.audit_row.route_tier,    $json._alert.audit_row.notif_priority,    $json._alert.audit_row.impact_level,    $json._alert.audit_row.impact_score,    $json._alert.audit_row.priority_score,    $json._alert.audit_row.confidence,    $json._alert.audit_row.competitor_flag,    $json.is_urgent,    $json._alert.audit_row.override_status,    $json._alert.audit_row.override_violation,    $json._alert.audit_row.recommended_action,    $json._alert.audit_row.signal_type,    $json._alert.audit_row.alert_channels,    $json._alert.audit_row.velocity_label,    $json._alert.audit_row.ai_summary,    $json._alert.audit_row.pipeline_version,    $json._alert.audit_row.routed_at  ]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2320,
+        -416
+      ],
+      "id": "b91c1195-56f3-4c71-b7ca-239416d1487f",
+      "name": "Postgres Audit Log2",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $input.item.json;\n\nreturn [{\n  json: {\n    ...s,\n    dead_letter: true,\n    dead_letter_type: 'AI_FAILED',\n    dead_letter_reason: 'AI triage failed after maximum retries',\n    dead_letter_at: new Date().toISOString()\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1424,
+        592
+      ],
+      "id": "05807773-92cf-4403-ac9f-a4802a175987",
+      "name": "Dead Letter (AI)"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch_ops",
+          "mode": "name"
+        },
+        "text": "={{ `🤖 AI_FAILED dead-lettered: ${$json.key_drug || $json.drug_name || 'Unknown'} — ${$json.key_indication || $json.indication || 'Unknown'} (signal_id=${$json.source_id || $json.id || 'N/A'})` }}\n",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        1632,
+        592
+      ],
+      "id": "14c7c2c4-5bda-481f-b889-2a63755dd4a3",
+      "name": "Send a message",
+      "webhookId": "a344828f-ee9c-4dd5-8622-ad2f9c87186a",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68cf1f7f-2d34-4bdd-b67f-f6ffdf6594d4",
+              "leftValue": "={{ $json.should_retry_db }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1936,
+        112
+      ],
+      "id": "41e637da-2219-4b80-b4c7-7b306add772c",
+      "name": "IF Retry DB"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68cf1f7f-2d34-4bdd-b67f-f6ffdf6594d4",
+              "leftValue": "={{ $json.should_retry_ai }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "33645a94-eabe-4eb0-9bfe-52892c180930",
+              "leftValue": "",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1280,
+        304
+      ],
+      "id": "daa79743-3ba2-4f1f-8dd6-e9d8ffc096c6",
+      "name": "IF RETRY AI"
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.min(30 * (1 + ($json.retry_count || 0)), 300) }}\n"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1488,
+        208
+      ],
+      "id": "a51bed07-0bb2-47c5-86a4-12dbe3934403",
+      "name": "Wait AI Backoff",
+      "webhookId": "d3b02fde-e367-43e9-836a-e7e507f89740"
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.min(10 * (1 + ($json.retry_count_safe || 0)), 120) }}\n\n"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2256,
+        80
+      ],
+      "id": "19161f69-1306-4925-8ab2-547611613e8a",
+      "name": "Wait DB Backoff",
+      "webhookId": "d3b02fde-e367-43e9-836a-e7e507f89740"
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $input.item.json;\nconst retrySafe = (s.retry_count_safe || 0) + 1;\n\nreturn [{\n  json: {\n    ...s,\n    retry_count_safe: retrySafe\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        80
+      ],
+      "id": "bc6e534f-b68f-4e19-b5ca-15198adb322f",
+      "name": "Increment retry_count_safe"
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $input.item.json;\nconst retry = (s.retry_count || 0) + 1;\n\nreturn [{\n  json: {\n    ...s,\n    retry_count: retry\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1584,
+        368
+      ],
+      "id": "4fdb7459-71dd-4938-bd2b-95eb608d3cdf",
+      "name": "Increment AI retry_count"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch_ops",
+          "mode": "name"
+        },
+        "text": "={{ `💾 DB_FAILED after retries: ${$json.key_drug || $json.drug_name || 'Unknown'} — ${$json.key_indication || $json.indication || 'Unknown'} (signal_id=${$json.source_id || $json.id || 'N/A'})` }}\n",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        2192,
+        256
+      ],
+      "id": "152f664b-58ed-480d-913f-7a79ba729ac3",
+      "name": "Send a message1",
+      "webhookId": "e8482873-6dd8-42dd-99ed-a6f1926cef92",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ╔══════════════════════════════════════════════════════════════╗\n * ║  OncoWatch — Format Digest / Archive Payload                 ║\n * ║  Handles: MED_ELEVATED, MED, LOW, DISMISS                   ║\n * ║  Version: 2.0.0 (production-grade)                          ║\n * ╚══════════════════════════════════════════════════════════════╝\n */\n\n'use strict';\n\n// ─────────────────────────────────────────────\n// 0. Helpers\n// ─────────────────────────────────────────────\nconst s = $input.item.json;\n\nconst isoNow = () => new Date().toISOString();\n\nconst safeStr = (v, fb = 'N/A') => {\n  if (v === null || v === undefined) return fb;\n  const out = String(v).trim();\n  return out === '' ? fb : out;\n};\n\nconst numOrNull = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : null;\n};\n\nconst clamp = (n, min, max) => Math.max(min, Math.min(n, max));\n\n// ─────────────────────────────────────────────\n// 1. Basic validation\n// ─────────────────────────────────────────────\nif (!s || typeof s !== 'object') {\n  throw new Error('[OncoWatch:Digest] Input item is null or not an object.');\n}\n\nif (!s.route_tier) {\n  throw new Error('[OncoWatch:Digest] route_tier is missing — Switch wiring or Restore node is wrong.');\n}\n\n// ─────────────────────────────────────────────\n// 2. Normalize core fields\n// ─────────────────────────────────────────────\nconst signalId      = safeStr(s.source_id || s.id, null);\nconst drug          = safeStr(s.key_drug  || s.drug_name, 'Unknown');\nconst indication    = safeStr(s.key_indication || s.indication, 'Unknown');\nconst sponsor       = safeStr(s.sponsor, 'Unknown');\nconst phase         = safeStr(s.phase || s.trial_phase, 'NA');\nconst trialStatus   = safeStr(s.status || s.trial_status, 'NA');\nconst signalType    = safeStr(s.signal_type, 'other');\n\nconst impactLevel   = safeStr(s.impact_level, 'LOW').toUpperCase();\nconst impactScore   = numOrNull(s.impact_score);\nconst priorityScore = numOrNull(s.priority_score);\nconst notifPriority = safeStr(s.notif_priority, 'P3');\nconst routeTierRaw  = safeStr(s.route_tier);\n\n// only allow known tiers\nconst VALID_TIERS = new Set(['MED_ELEVATED', 'MED', 'LOW', 'DISMISS']);\nconst routeTier   = VALID_TIERS.has(routeTierRaw) ? routeTierRaw : 'LOW';\n\nconst recAction   = safeStr(s.recommended_action, 'MONITOR').toUpperCase();\nconst aiSummary   = safeStr(s.ai_summary, '');\nconst competitor  = !!s.competitor_flag;\nconst isUrgent    = !!s.is_urgent;\nconst velocityLabel = safeStr(s.velocity_label, 'STABLE');\nconst url         = safeStr(s.url, '');\nconst firstSeenAt = safeStr(s.first_seen_at, '');\nconst ageHours    = numOrNull(s.age_hours);\nconst scoringVer  = numOrNull(s.scoring_version) ?? 0;\n\nconst confidence  = numOrNull(s.score_breakdown?.confidence);\nconst driversArr  = Array.isArray(s.score_breakdown?.drivers)\n  ? s.score_breakdown.drivers\n  : [];\nconst risksArr    = Array.isArray(s.score_breakdown?.risks)\n  ? s.score_breakdown.risks\n  : [];\n\n// ─────────────────────────────────────────────\n// 3. Tier label + risk class\n// ─────────────────────────────────────────────\nconst tierLabel =\n  routeTier === 'MED_ELEVATED' ? 'MED (Elevated)' :\n  routeTier === 'MED'          ? 'MED' :\n  routeTier === 'LOW'          ? 'LOW' :\n  routeTier === 'DISMISS'      ? 'DISMISS' :\n  routeTier;\n\n// risk class for digest-level filtering\nlet riskClass;\nif (impactLevel === 'HIGH') {\n  riskClass = 'HIGH';\n} else if (impactLevel === 'MED') {\n  riskClass = 'MED';\n} else {\n  riskClass = 'LOW';\n}\n\n// ─────────────────────────────────────────────\n// 4. Short formatted bullets for Slack/Email digest\n// ─────────────────────────────────────────────\nconst impactScoreDisplay = impactScore !== null ? `${impactScore}/10` : 'N/A';\nconst confDisplay = confidence !== null\n  ? `${Math.round(clamp(confidence, 0, 1) * 100)}%`\n  : 'N/A';\n\nconst digestLine =\n  `• [${tierLabel}] ${drug} — ${indication} ` +\n  `(Impact: ${impactLevel} ${impactScoreDisplay}, ` +\n  `Confidence: ${confDisplay}, ` +\n  `Competitor: ${competitor ? 'YES' : 'NO'}, ` +\n  `Velocity: ${velocityLabel})`;\n\n// ─────────────────────────────────────────────\n// 5. Digest entry object (compact but rich)\n// ─────────────────────────────────────────────\nconst digestEntry = {\n  signal_id:        signalId,\n  route_tier:       routeTier,\n  tier_label:       tierLabel,\n  risk_class:       riskClass,\n  notif_priority:   notifPriority,\n  drug,\n  indication,\n  sponsor,\n  phase,\n  status:           trialStatus,\n  impact_level:     impactLevel,\n  impact_score:     impactScore,\n  priority_score:   priorityScore,\n  confidence:       confidence,\n  competitor_flag:  competitor,\n  is_urgent:        isUrgent,\n  velocity_label:   velocityLabel,\n  recommended_action: recAction,\n  signal_type:      signalType,\n  url:              url || null,\n  ai_summary:       aiSummary,\n  first_seen_at:    firstSeenAt || null,\n  age_hours:        ageHours,\n  scoring_version:  scoringVer,\n  created_at:       isoNow(),\n};\n\n// ─────────────────────────────────────────────\n// 6. Drivers / risks — trimmed for digest\n// ─────────────────────────────────────────────\nconst driversDigest = driversArr.length\n  ? driversArr.slice(0, 3).map(d => `• ${d}`).join('\\n')\n  : 'N/A';\n\nconst risksDigest = risksArr.length\n  ? risksArr.slice(0, 2).map(r => `⚠ ${r}`).join('\\n')\n  : 'N/A';\n\n// ─────────────────────────────────────────────\n// 7. Archive blob (full payload for cold storage)\n// ─────────────────────────────────────────────\nconst archiveBlob = {\n  ...s,\n  archived_at: isoNow(),\n};\n\n// ─────────────────────────────────────────────\n// 8. Routing hints for downstream queues\n// ─────────────────────────────────────────────\nconst isDailyCandidate =\n  ['MED_ELEVATED', 'MED'].includes(routeTier) && !s.send_daily && !s.dead_letter;\n\nconst isWeeklyCandidate =\n  routeTier === 'LOW' && !s.send_weekly && !s.dead_letter;\n\nconst isDismissCandidate =\n  routeTier === 'DISMISS';\n\n// ─────────────────────────────────────────────\n// 9. Enriched output\n// ─────────────────────────────────────────────\nreturn [{\n  json: {\n    ...s,\n    _digest: {\n      line:          digestLine,\n      entry:         digestEntry,\n      tier_label:    tierLabel,\n      risk_class:    riskClass,\n      drivers_text:  driversDigest,\n      risks_text:    risksDigest,\n      is_daily_candidate:  isDailyCandidate,\n      is_weekly_candidate: isWeeklyCandidate,\n      is_dismiss_candidate: isDismissCandidate,\n      formatted_at:  isoNow(),\n    },\n    _archive: archiveBlob,\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2048,
+        -192
+      ],
+      "id": "6ba015ff-9120-458f-b377-64c28d29a6ae",
+      "name": "Format Digest/Archive"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f292a9e8-60d2-4643-96c2-5da3068ab3a3",
+              "leftValue": "={{ $json.route_tier }}",
+              "rightValue": "MED_ELEVATED",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "684b97b2-1c14-4fea-979b-35240700f1ec",
+              "leftValue": "={{ $json.route_tier }}",
+              "rightValue": "MED",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2256,
+        -192
+      ],
+      "id": "1d032364-9ca3-443d-bc3e-797f431981f6",
+      "name": "IF Daily ?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_daily_digest_queue (\n  signal_id, route_tier, digest_line, digest_json\n) VALUES (\n  $1, $2, $3, $4\n);\n",
+        "options": {
+          "queryReplacement": "={{ [  $json._digest.entry.signal_id,  $json._digest.entry.route_tier,  $json._digest.line,  $json._digest.entry] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2464,
+        -288
+      ],
+      "id": "b744ca38-46a3-4e61-b75f-26ac5216a9c7",
+      "name": "Add to Daily Digest",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "80a03702-be32-41fa-8313-0a80423a0f7d",
+              "leftValue": "={{ $json.route_tier }}",
+              "rightValue": "LOW",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2464,
+        -96
+      ],
+      "id": "d770c679-6514-4092-aa7d-643108c52cf7",
+      "name": "IF Weekly?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_weekly_digest_queue (\n  signal_id,\n  route_tier,\n  tier_label,\n  risk_class,\n  notif_priority,\n  drug,\n  indication,\n  sponsor,\n  phase,\n  status,\n  impact_level,\n  impact_score,\n  priority_score,\n  confidence,\n  competitor_flag,\n  is_urgent,\n  velocity_label,\n  recommended_action,\n  signal_type,\n  url,\n  ai_summary,\n  first_seen_at,\n  age_hours,\n  scoring_version,\n  digest_line,\n  digest_json\n) VALUES (\n  $1,$2,$3,$4,$5,\n  $6,$7,$8,$9,$10,\n  $11,$12,$13,$14,$15,\n  $16,$17,$18,$19,$20,\n  $21,$22,$23,$24,$25,\n  $26\n);\n",
+        "options": {
+          "queryReplacement": "={{\n  [\n    $json._digest.entry.signal_id,\n    $json._digest.entry.route_tier,\n    $json._digest.entry.tier_label,\n    $json._digest.entry.risk_class,\n    $json._digest.entry.notif_priority,\n    $json._digest.entry.drug,\n    $json._digest.entry.indication,\n    $json._digest.entry.sponsor,\n    $json._digest.entry.phase,\n    $json._digest.entry.status,\n    $json._digest.entry.impact_level,\n    $json._digest.entry.impact_score,\n    $json._digest.entry.priority_score,\n    $json._digest.entry.confidence,\n    $json._digest.entry.competitor_flag,\n    $json._digest.entry.is_urgent,\n    $json._digest.entry.velocity_label,\n    $json._digest.entry.recommended_action,\n    $json._digest.entry.signal_type,\n    $json._digest.entry.url,\n    $json._digest.entry.ai_summary,\n    $json._digest.entry.first_seen_at,\n    $json._digest.entry.age_hours,\n    $json._digest.entry.scoring_version,\n    $json._digest.line,\n    $json._digest.entry\n  ]\n}}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2720,
+        -160
+      ],
+      "id": "1a9fa4b7-4b4d-41ab-be99-b079c16ae466",
+      "name": "Add to Weekly Digest",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a502a8e7-f4f3-4574-876d-1ee4895b186d",
+              "leftValue": "={{ $json.route_tier }}",
+              "rightValue": "DISMISS",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2672,
+        0
+      ],
+      "id": "0abfae31-6126-4229-8a9b-21cc61e9197d",
+      "name": "IF Dismiss?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_archive (\n  signal_id, route_tier, impact_level, impact_score, payload\n) VALUES (\n  $1, $2, $3, $4, $5\n);\n",
+        "options": {
+          "queryReplacement": "={{ [\n  $json._archive.source_id || $json._archive.id || null,\n  $json.route_tier,\n  $json.impact_level,\n  $json.impact_score,\n  $json._archive\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2960,
+        -64
+      ],
+      "id": "f281553c-7685-4486-9206-ba511b3e8cb0",
+      "name": "Archive Node",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ci_audit_log (\n  signal_id,\n  route_tier,\n  notif_priority,\n  impact_level,\n  impact_score,\n  priority_score,\n  confidence,\n  competitor_flag,\n  is_urgent,\n  override_status,\n  override_violation,\n  recommended_action,\n  signal_type,\n  alert_channels,\n  velocity_label,\n  ai_summary,\n  pipeline_version,\n  routed_at\n)\nVALUES (\n  $1, $2, $3, $4, $5, $6, $7, $8, $9,\n  $10, $11, $12, $13, $14, $15, $16, $17, $18\n)\nON CONFLICT DO NOTHING\nRETURNING id, signal_id, route_tier, routed_at;\n",
+        "options": {
+          "queryReplacement": "={{  [    $json._alert.audit_row.signal_id,    $json._alert.audit_row.route_tier,    $json._alert.audit_row.notif_priority,    $json._alert.audit_row.impact_level,    $json._alert.audit_row.impact_score,    $json._alert.audit_row.priority_score,    $json._alert.audit_row.confidence,    $json._alert.audit_row.competitor_flag,    $json.is_urgent,    $json._alert.audit_row.override_status,    $json._alert.audit_row.override_violation,    $json._alert.audit_row.recommended_action,    $json._alert.audit_row.signal_type,    $json._alert.audit_row.alert_channels,    $json._alert.audit_row.velocity_label,    $json._alert.audit_row.ai_summary,    $json._alert.audit_row.pipeline_version,    $json._alert.audit_row.routed_at  ]}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2960,
+        128
+      ],
+      "id": "b09b0a49-ed9e-4122-b837-27e7317cc6c3",
+      "name": "Postgres Audit Log3",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.item;\nconst s = item.json;\n\n// Build the audit JSON payload (you can tweak this)\nconst auditPayload = {\n  signal_id:       s.source_id || s.id || 'N/A',\n  route_tier:      s.route_tier || 'N/A',\n  notif_priority:  s.notif_priority || 'P0',\n  impact_level:    s.impact_level || 'N/A',\n  impact_score:    s.impact_score ?? null,\n  priority_score:  s.priority_score ?? null,\n  confidence:      typeof s.score_breakdown?.confidence === 'number'\n                     ? s.score_breakdown.confidence\n                     : null,\n  competitor_flag: !!s.competitor_flag,\n  is_urgent:       !!s.is_urgent,\n  override_status: s.override_status || 'none',\n  override_violation: !!s.override_violation,\n  recommended_action: s.recommended_action || 'N/A',\n  signal_type:     s.signal_type || 'N/A',\n  alert_channels:  s.alert_channels || [],\n  velocity_label:  s.velocity_label || 'N/A',\n  ai_summary:      s.ai_summary || '',\n  routed_at:       new Date().toISOString(),\n  pipeline_version: s._triage_meta?.pipeline_version || 'N/A',\n};\n\nconst jsonString = JSON.stringify(auditPayload, null, 2);\n\nreturn [{\n  json: item.json,\n  binary: {\n    oncowatch_audit: {\n      data: Buffer.from(jsonString).toString('base64'),\n      fileName: `oncowatch_audit_${s.source_id || s.id || 'unknown'}.json`,\n      mimeType: 'application/json',\n    },\n  },\n}];\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        -1776
+      ],
+      "id": "511ab8ad-adbc-4f9e-8cba-ed41ca9d240b",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1824,
+        -1776
+      ],
+      "id": "ee50adc0-0ed5-41c3-b7ea-ce9378363175",
+      "name": "Merge"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Signals Needing AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Signals Needing AI": {
+      "main": [
+        [
+          {
+            "node": "Build AI Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Input": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge AI Output": {
+      "main": [
+        [
+          {
+            "node": "Update Signal with AI Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Signal with AI Triage": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Format CRITICAL Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format HIGH_COMPETITOR Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format HIGH Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Digest/Archive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Digest/Archive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Digest/Archive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Digest/Archive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF RETRY AI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF Retry DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Merge AI Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format CRITICAL Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack Exec Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack Medical Affairs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Postgres Audit Log1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          },
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Medical Affairs": {
+      "main": [
+        []
+      ]
+    },
+    "Format HIGH_COMPETITOR Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack CI Team",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email CI Team",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Postgres Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack CI Team": {
+      "main": [
+        []
+      ]
+    },
+    "Format HIGH Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack Medical Affairs1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Medical Affairs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Postgres Audit Log2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead Letter (AI)": {
+      "main": [
+        [
+          {
+            "node": "Update Signal with AI Triage",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF RETRY AI": {
+      "main": [
+        [
+          {
+            "node": "Wait AI Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dead Letter (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait AI Backoff": {
+      "main": [
+        [
+          {
+            "node": "Increment AI retry_count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Retry DB": {
+      "main": [
+        [
+          {
+            "node": "Wait DB Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send a message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait DB Backoff": {
+      "main": [
+        [
+          {
+            "node": "Increment retry_count_safe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Increment retry_count_safe": {
+      "main": [
+        [
+          {
+            "node": "Update Signal with AI Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Increment AI retry_count": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest/Archive": {
+      "main": [
+        [
+          {
+            "node": "IF Daily ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Daily ?": {
+      "main": [
+        [
+          {
+            "node": "Add to Daily Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF Weekly?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Weekly?": {
+      "main": [
+        [
+          {
+            "node": "Add to Weekly Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF Dismiss?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Dismiss?": {
+      "main": [
+        [
+          {
+            "node": "Archive Node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres Audit Log3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Email Executive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "b1d90bda-1f3a-4fb7-b8cf-0ba6726b1d1e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a8a891a30415836be7de9e961a55fb56810b2ca8a0f8f3007a592ec0e56663ad"
+  },
+  "id": "FSADjYN1sFv7Vgw_nfj4f",
+  "tags": []
+}

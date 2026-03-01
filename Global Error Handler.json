@@ -1,0 +1,125 @@
+{
+  "name": "Global Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "f9f94796-f035-4776-87a0-f5bc63c66c3d",
+      "name": "Error Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\n\nreturn [{\n  json: {\n    workflow_name: e.workflow?.name || 'Unknown Workflow',\n    workflow_id: e.workflow?.id || '',\n    execution_id: e.execution?.id || '',\n    error_message: e.execution?.error?.message || 'No error message',\n    error_node: e.execution?.lastNodeExecuted || 'Unknown node',\n    created_at: new Date().toISOString()\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        0
+      ],
+      "id": "89dba305-0dc2-4c9d-875b-49c77146d98a",
+      "name": "Format Error"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO workflow_errors (\n  workflow_name,\n  workflow_id,\n  execution_id,\n  error_message,\n  error_node,\n  created_at\n)\nVALUES (\n  '{{ ($json.workflow_name || \"\").replace(/'/g, \"''\") }}',\n  '{{ ($json.workflow_id || \"\") }}',\n  '{{ ($json.execution_id || \"\") }}',\n  '{{ ($json.error_message || \"\").replace(/'/g, \"''\") }}',\n  '{{ ($json.error_node || \"\").replace(/'/g, \"''\") }}',\n  NOW()\n);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        416,
+        0
+      ],
+      "id": "1b5a2f93-5375-4290-9298-b3d11bb9020e",
+      "name": "Log Error to Postgres",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-alert",
+          "mode": "name"
+        },
+        "text": "=⛔ ONCOWATCH WORKFLOW ERROR  Workflow: {{ $json.workflow_name }} Failed Node: {{ $json.error_node }} Error: {{ $json.error_message }} Execution ID: {{ $json.execution_id }} Time: {{ $json.created_at }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        624,
+        0
+      ],
+      "id": "882e091b-3e06-4f4b-82de-2fa6274db36e",
+      "name": "Send a message",
+      "webhookId": "4ff5c2b4-10b1-4db9-ab3e-06a51c483b36",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Log Error to Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Error to Postgres": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "8e6184f4-e8b3-49d0-a2e5-7acbed55d86b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a8a891a30415836be7de9e961a55fb56810b2ca8a0f8f3007a592ec0e56663ad"
+  },
+  "id": "u6wXIEA7ztp5OTXi2YqW2",
+  "tags": []
+}

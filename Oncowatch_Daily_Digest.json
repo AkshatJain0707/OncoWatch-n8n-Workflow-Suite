@@ -1,0 +1,450 @@
+{
+  "name": "Oncowatch_Daily_Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "e9b07d58-80f1-48c2-81f8-c0e6f889e2fa",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  s.source_id,\n  s.source,\n  s.title,\n  s.sponsor,\n  s.drug_name,\n  s.key_drug,\n  s.key_indication,\n  s.impact_level,\n  s.impact_score,\n  s.signal_type,\n  s.competitor_flag,\n  s.ai_summary,\n  s.recommended_action,\n  s.url,\n  s.version,\n  s.first_seen_at,\n  s.last_seen_at,\n  -- Is this a new signal or update?\n  CASE WHEN s.version = 1 THEN 'NEW' ELSE 'UPDATE' END AS signal_status,\n  -- Days since first seen\n  EXTRACT(DAY FROM (NOW() - s.first_seen_at))::int AS age_days\nFROM signals s\nWHERE s.last_seen_at >= (NOW() - INTERVAL '24 hours')\nORDER BY\n  CASE s.impact_level\n    WHEN 'HIGH' THEN 1\n    WHEN 'MED'  THEN 2\n    WHEN 'LOW'  THEN 3\n    ELSE 4\n  END,\n  s.impact_score DESC,\n  s.last_seen_at DESC;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "339971c8-d69d-4329-8722-82f04f91cec4",
+      "name": "Fetch last 24h signal",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  DATE(last_seen_at) AS signal_date,\n  impact_level,\n  COUNT(*) AS count,\n  AVG(impact_score)::numeric(5,2) AS avg_score,\n  SUM(CASE WHEN competitor_flag THEN 1 ELSE 0 END) AS competitor_count,\n  SUM(CASE WHEN version = 1 THEN 1 ELSE 0 END) AS new_signals,\n  SUM(CASE WHEN version > 1 THEN 1 ELSE 0 END) AS updated_signals\nFROM signals\nWHERE last_seen_at >= (NOW() - INTERVAL '7 days')\nGROUP BY DATE(last_seen_at), impact_level\nORDER BY signal_date DESC, impact_level;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        192
+      ],
+      "id": "24b6a262-83d7-49c7-849b-ea7b1e9948d7",
+      "name": "Fetch last 7day signal",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  drug_name,\n  key_drug,\n  sponsor,\n  key_indication,\n  COUNT(*) AS signal_count,\n  MAX(impact_score) AS peak_score,\n  MIN(first_seen_at)::date AS first_seen,\n  STRING_AGG(DISTINCT signal_type, ', ') AS signal_types,\n  STRING_AGG(DISTINCT source, ', ') AS sources\nFROM signals\nWHERE competitor_flag = TRUE\n  AND last_seen_at >= (NOW() - INTERVAL '7 days')\nGROUP BY drug_name, key_drug, sponsor, key_indication\nORDER BY peak_score DESC, signal_count DESC\nLIMIT 10;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        -192
+      ],
+      "id": "76d162cf-8b0d-489f-aeca-0d5540f11ad7",
+      "name": "Fetch competitor intel",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COALESCE(key_indication, 'Unknown') AS indication,\n  COUNT(*) AS total_signals,\n  SUM(CASE WHEN impact_level = 'HIGH' THEN 1 ELSE 0 END) AS high_count,\n  SUM(CASE WHEN impact_level = 'MED'  THEN 1 ELSE 0 END) AS med_count,\n  SUM(CASE WHEN competitor_flag THEN 1 ELSE 0 END) AS competitor_signals,\n  AVG(impact_score)::numeric(5,2) AS avg_score,\n  MAX(impact_score) AS max_score\nFROM signals\nWHERE last_seen_at >= (NOW() - INTERVAL '24 hours')\nGROUP BY key_indication\nORDER BY high_count DESC, total_signals DESC\nLIMIT 12;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        -352
+      ],
+      "id": "192eaa61-59e2-40a9-b60f-027f5b9e7a89",
+      "name": "Fetch Indication Heatmap",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        416,
+        -192
+      ],
+      "id": "3306e732-4f4c-46f5-bd7d-fee97ada7a34",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Inputs expected:\n// Input 1: Fetch competitor intel\n// Input 2: Fetch Indication Heatmap\n// Input 3: Fetch last 24h signal\n// Input 4: Fetch last 7day signal\n\n// Pull data from the named nodes (make sure names match exactly)\nconst signals24h      = $('Fetch last 24h signal').all().map(i => i.json);\nconst trend7d         = $('Fetch last 7day signal').all().map(i => i.json);\nconst competitorIntel = $('Fetch competitor intel').all().map(i => i.json);\nconst heatmap         = $('Fetch Indication Heatmap').all().map(i => i.json);\n\nconst today = new Date().toISOString().slice(0, 10);\nconst now   = new Date().toISOString();\n\n// ─── 24h Segmentation (no impact_score assumed) ───────────\nconst highSignals = signals24h.filter(s =>\n  String(s.impact_level || '').toUpperCase() === 'HIGH'\n);\nconst medSignals = signals24h.filter(s =>\n  String(s.impact_level || '').toUpperCase() === 'MED'\n);\nconst lowSignals = signals24h.filter(s =>\n  String(s.impact_level || '').toUpperCase() === 'LOW'\n);\nconst newSignals     = signals24h.filter(s => s.signal_status === 'NEW');\nconst updatedSignals = signals24h.filter(s => s.signal_status === 'UPDATE');\nconst competitorHits = signals24h.filter(s => s.competitor_flag);\n\n// If you don't have impact_score in DB yet, just set simple metrics\nconst avgScore = 0;\nconst maxScore = 0;\nconst topSignal = signals24h[0] || null;\n\n// ─── 7d Trend Analysis ─────────────────────────────────────\nconst todayData     = trend7d.filter(t => t.signal_date === today);\nconst yesterdayDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);\nconst yesterdayData = trend7d.filter(t => t.signal_date === yesterdayDate);\n\nconst todayTotal     = todayData.reduce((s, t) => s + parseInt(t.count || 0, 10), 0);\nconst yesterdayTotal = yesterdayData.reduce((s, t) => s + parseInt(t.count || 0, 10), 0);\nconst trendDelta     = todayTotal - yesterdayTotal;\nconst trendPct       = yesterdayTotal > 0\n  ? ((trendDelta / yesterdayTotal) * 100).toFixed(1)\n  : 'N/A';\nconst trendArrow     = trendDelta > 0 ? '📈' : trendDelta < 0 ? '📉' : '➡️';\n\n// 7-day rolling high count\nconst weekHighCount = trend7d\n  .filter(t => String(t.impact_level || '').toUpperCase() === 'HIGH')\n  .reduce((s, t) => s + parseInt(t.count || 0, 10), 0);\n\n// ─── Signal Type Breakdown ─────────────────────────────────\nconst typeBreakdown = {};\nsignals24h.forEach(s => {\n  const t = s.signal_type || 'unknown';\n  typeBreakdown[t] = (typeBreakdown[t] || 0) + 1;\n});\nconst typeBreakdownStr = Object.entries(typeBreakdown)\n  .sort((a, b) => b[1] - a[1])\n  .map(([k, v]) => `${k}: ${v}`)\n  .join(' | ');\n\n// ─── Source Breakdown ──────────────────────────────────────\nconst sourceBreakdown = {};\nsignals24h.forEach(s => {\n  const src = s.source || 'unknown';\n  sourceBreakdown[src] = (sourceBreakdown[src] || 0) + 1;\n});\nconst sourceBreakdownStr = Object.entries(sourceBreakdown)\n  .sort((a, b) => b[1] - a[1])\n  .map(([k, v]) => `${k}(${v})`)\n  .join(', ');\n\n// ─── Top Drugs by Frequency ────────────────────────────────\nconst drugFreq = {};\nsignals24h.forEach(s => {\n  const d = s.key_drug || s.drug_name || 'Unknown';\n  drugFreq[d] = (drugFreq[d] || 0) + 1;\n});\nconst topDrugs = Object.entries(drugFreq)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 5)\n  .map(([d, c]) => `*${d}* (${c})`)\n  .join(', ');\n\n// ─── Risk Assessment (counts only) ─────────────────────────\nlet riskLevel = 'LOW';\nlet riskReason = 'No urgent competitive threats';\nif (highSignals.length >= 5 || competitorHits.length >= 3) {\n  riskLevel = 'CRITICAL';\n  riskReason = 'Multiple HIGH signals + significant competitor activity';\n} else if (highSignals.length >= 2 || competitorHits.length >= 1) {\n  riskLevel = 'ELEVATED';\n  riskReason = 'Competitor signals or multiple HIGH impact events detected';\n} else if (highSignals.length === 1) {\n  riskLevel = 'MODERATE';\n  riskReason = 'Single HIGH impact signal requires monitoring';\n}\n\nconst riskEmoji = {\n  CRITICAL: '🔴', ELEVATED: '🟠', MODERATE: '🟡', LOW: '🟢'\n}[riskLevel];\n\n// ─── Build Context String for AI ──────────────────────────\nconst aiContextLines = signals24h.slice(0, 10).map((s, i) =>\n  `${i + 1}. [${s.impact_level}] ${s.key_drug || s.drug_name || 'Unknown'} | ` +\n  `${s.key_indication || 'Unknown'} | ${s.sponsor || 'Unknown'} | ` +\n  `${s.signal_type || 'unknown'} | ${s.ai_summary || 'No summary'}`\n).join('\\n');\n\n// ─── Build Indication Heatmap String ──────────────────────\nconst heatmapStr = heatmap.slice(0, 6).map(h =>\n  `${h.indication}: ${h.total_signals} signals (H:${h.high_count} M:${h.med_count})`\n).join('\\n');\n\n// ─── Competitor Intel String ───────────────────────────────\nconst competitorStr = competitorIntel.slice(0, 5).map((c, i) =>\n  `${i + 1}. ${c.key_drug || c.drug_name || 'Unknown'} (${c.sponsor || 'Unknown'}) — ` +\n  `${c.key_indication || 'Unknown'} | ${c.signal_count} signals`\n).join('\\n');\n\n// ─── Digest body for Slack text node ──────────────────────\nconst digestBody = [\n  highSignals.length > 0 ? `🚨 *HIGH IMPACT SIGNALS*\\n` + highSignals.map((s, i) => {\n    const drug = s.key_drug || s.drug_name || 'Unknown';\n    const status = s.signal_status === 'NEW' ? '🆕 NEW' : `🔄 v${s.version || 1}`;\n    const rival = s.competitor_flag ? ' ⚠️ COMPETITOR' : '';\n    return (\n      `*${i+1}. ${drug}* — ${s.key_indication || 'Unknown'} ${status}${rival}\\n` +\n      `> Sponsor: ${s.sponsor || 'N/A'} | Type: ${s.signal_type || 'unknown'}\\n` +\n      `> ${s.ai_summary || 'No summary'}\\n` +\n      `> 🎯 Action: _${s.recommended_action || 'Monitor'}_\\n` +\n      `> 🔗 ${s.url || 'No URL'}`\n    );\n  }).join('\\n\\n') : '',\n\n  medSignals.length > 0 ? `\\n🟡 *MED IMPACT SIGNALS (top 5 of ${medSignals.length})*\\n` + medSignals.slice(0,5).map((s, i) => {\n    const drug = s.key_drug || s.drug_name || 'Unknown';\n    const status = s.signal_status === 'NEW' ? '🆕 NEW' : `🔄 v${s.version || 1}`;\n    const rival = s.competitor_flag ? ' ⚠️ COMPETITOR' : '';\n    return (\n      `*${i+1}. ${drug}* — ${s.key_indication || 'Unknown'} ${status}${rival}\\n` +\n      `> Sponsor: ${s.sponsor || 'N/A'}\\n` +\n      `> ${s.ai_summary || 'No summary'}\\n` +\n      `> 🎯 Action: _${s.recommended_action || 'Monitor'}_`\n    );\n  }).join('\\n\\n') : '',\n\n  heatmap.length > 0 ? `\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n🗺️ *Indication Heatmap*\\n` + heatmap.slice(0,6).map(h =>\n    `• *${h.indication}*: ${h.total_signals} signals (🚨${h.high_count} 🟡${h.med_count}) | competitor: ${h.competitor_signals}`\n  ).join('\\n') : '',\n\n  competitorIntel.length > 0 ? `\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n🕵️ *7-Day Competitor Radar*\\n` + competitorIntel.slice(0,5).map((c, i) =>\n    `${i+1}. *${c.key_drug || c.drug_name}* (${c.sponsor}) — ${c.key_indication} | ${c.signal_count} signals`\n  ).join('\\n') : '',\n\n  `\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,\n  `💊 *Top Drugs:* ${topDrugs || 'N/A'}`,\n  `📁 *Signal Types:* ${typeBreakdownStr || 'N/A'}`,\n  `🌐 *Sources:* ${sourceBreakdownStr || 'N/A'}`,\n  `\\n_OncoWatch CI System | ${now}_`\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    signals24h,\n    highSignals,\n    medSignals,\n    lowSignals,\n    competitorIntel,\n    heatmap,\n    trend7d,\n\n    today,\n    now,\n    total24h: signals24h.length,\n    highCount: highSignals.length,\n    medCount: medSignals.length,\n    lowCount: lowSignals.length,\n    newCount: newSignals.length,\n    updatedCount: updatedSignals.length,\n    competitorCount: competitorHits.length,\n    avgScore,\n    maxScore,\n    topSignal,\n\n    trendDelta,\n    trendPct,\n    trendArrow,\n    weekHighCount,\n\n    typeBreakdownStr,\n    sourceBreakdownStr,\n    topDrugs,\n\n    riskLevel,\n    riskReason,\n    riskEmoji,\n\n    aiContextLines,\n    heatmapStr,\n    competitorStr,\n    digestBody\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        -192
+      ],
+      "id": "371092f1-0e21-44d6-8029-ef4761655111",
+      "name": "Compute Analytics"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Compute Analytics').first().json;\nconst aiResponse = $input.first().json;\nconst execSummary = aiResponse?.choices?.[0]?.message?.content || 'AI summary unavailable.';\n\n// ─── Safe accessor ────────────────────────────────────────\nconst safe = (v, fallback = 'N/A') =>\n  (v !== null && v !== undefined && String(v).trim() !== '') ? String(v) : fallback;\n\n// ─── Risk color map ───────────────────────────────────────\nconst riskColor = {\n  CRITICAL: '#FF0000',\n  ELEVATED: '#FF6600',\n  MODERATE: '#FFB300',\n  LOW:      '#36A64F'\n}[d.riskLevel] || '#36A64F';\n\n// ─── Helper: divider ──────────────────────────────────────\nconst divider = () => ({ type: 'divider' });\n\n// ─── Helper: signal block ─────────────────────────────────\nfunction signalBlock(s, index) {\n  const drug      = safe(s.key_drug || s.drug_name);\n  const indication = safe(s.key_indication);\n  const sponsor   = safe(s.sponsor);\n  const score     = safe(s.impact_score, '0');\n  const type      = safe(s.signal_type);\n  const version   = parseInt(s.version || 1, 10);\n  const status    = s.signal_status === 'NEW' ? '🆕 NEW' : `🔄 v${version}`;\n  const rival     = s.competitor_flag ? ' ⚠️ *COMPETITOR*' : '';\n  const urgent    = s.is_urgent ? ' 🔴 *URGENT*' : '';\n  const lvlEmoji  = s.impact_level === 'HIGH' ? '🚨' : '🟡';\n  const url       = safe(s.url, 'https://clinicaltrials.gov');\n\n  return {\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text:\n        `${lvlEmoji} *${index + 1}. ${drug}* — ${indication} ${status}${rival}${urgent}\\n` +\n        `> Sponsor: *${sponsor}* | Type: \\`${type}\\` | Score: *${score}/10*\\n` +\n        `> ${safe(s.ai_summary, 'No summary available')}\\n` +\n        `> 🎯 _Action: ${safe(s.recommended_action, 'Monitor')}_`\n    },\n    accessory: {\n      type: 'button',\n      text: { type: 'plain_text', text: '🔗 View Source', emoji: true },\n      url,\n      action_id: `view_source_${index}`\n    }\n  };\n}\n\n// ─── Safe arrays ──────────────────────────────────────────\nconst highSignals    = Array.isArray(d.highSignals)    ? d.highSignals    : [];\nconst medSignals     = Array.isArray(d.medSignals)     ? d.medSignals     : [];\nconst heatmap        = Array.isArray(d.heatmap)        ? d.heatmap        : [];\nconst competitorIntel = Array.isArray(d.competitorIntel) ? d.competitorIntel : [];\n\n// ─── Trend delta display ──────────────────────────────────\nconst trendDelta     = d.trendDelta || 0;\nconst trendDisplay   = `${trendDelta > 0 ? '+' : ''}${trendDelta} signals (${safe(d.trendPct, 'N/A')}%)`;\n\n// ─── BUILD BLOCKS ─────────────────────────────────────────\nconst blocks = [];\n\n// HEADER\nblocks.push({\n  type: 'header',\n  text: {\n    type: 'plain_text',\n    text: `📋 OncoWatch Daily Digest — ${safe(d.today)}`,\n    emoji: true\n  }\n});\n\n// METRICS ROW 1\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `${safe(d.riskEmoji, '⚪')} *Risk Level*\\n${safe(d.riskLevel)}` },\n    { type: 'mrkdwn', text: `📊 *Total Signals (24h)*\\n${safe(d.total24h, '0')}` },\n    { type: 'mrkdwn', text: `🚨 *HIGH Impact*\\n${safe(d.highCount, '0')}` },\n    { type: 'mrkdwn', text: `🟡 *MED Impact*\\n${safe(d.medCount, '0')}` },\n    { type: 'mrkdwn', text: `🆕 *New Signals*\\n${safe(d.newCount, '0')}` },\n    { type: 'mrkdwn', text: `⚠️ *Competitor Hits*\\n${safe(d.competitorCount, '0')}` }\n  ]\n});\n\n// METRICS ROW 2\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `${safe(d.trendArrow, '➡️')} *vs Yesterday*\\n${trendDisplay}` },\n    { type: 'mrkdwn', text: `📅 *7-day HIGH total*\\n${safe(d.weekHighCount, '0')}` },\n    { type: 'mrkdwn', text: `⭐ *Avg Score*\\n${safe(d.avgScore, '0')}/10` },\n    { type: 'mrkdwn', text: `🔥 *Peak Score*\\n${safe(d.maxScore, '0')}/10` }\n  ]\n});\n\nblocks.push(divider());\n\n// AI EXECUTIVE SUMMARY\nblocks.push({\n  type: 'section',\n  text: {\n    type: 'mrkdwn',\n    text: `🤖 *AI Executive Summary*\\n\\n${execSummary}`\n  }\n});\nblocks.push({\n  type: 'section',\n  text: {\n    type: 'mrkdwn',\n    text: `${safe(d.riskEmoji, '⚪')} *Risk Assessment:* ${safe(d.riskReason)}`\n  }\n});\nblocks.push(divider());\n\n// HIGH IMPACT SIGNALS\nif (highSignals.length > 0) {\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `🚨 *HIGH IMPACT SIGNALS (${highSignals.length})*` }\n  });\n  highSignals.forEach((s, i) => {\n    blocks.push(signalBlock(s, i));\n    blocks.push(divider());\n  });\n}\n\n// MED IMPACT SIGNALS\nif (medSignals.length > 0) {\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `🟡 *MED IMPACT SIGNALS (top 6 of ${medSignals.length})*` }\n  });\n  medSignals.slice(0, 6).forEach((s, i) => {\n    blocks.push(signalBlock(s, i));\n    blocks.push(divider());\n  });\n  if (medSignals.length > 6) {\n    blocks.push({\n      type: 'section',\n      text: {\n        type: 'mrkdwn',\n        text: `_...${medSignals.length - 6} more MED signals not shown. Query DB for full list._`\n      }\n    });\n    blocks.push(divider());\n  }\n}\n\n// INDICATION HEATMAP\nif (heatmap.length > 0) {\n  const hmText = heatmap.slice(0, 6).map(h =>\n    `• *${safe(h.indication)}*: ${safe(h.total_signals)} signals ` +\n    `(🚨${safe(h.high_count, '0')} 🟡${safe(h.med_count, '0')}) ` +\n    `| avg score: ${safe(h.avg_score, 'N/A')} ` +\n    `| competitor hits: ${safe(h.competitor_signals, '0')}`\n  ).join('\\n');\n\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `🗺️ *Indication Heatmap (24h)*\\n\\n${hmText}` }\n  });\n  blocks.push(divider());\n}\n\n// COMPETITOR INTELLIGENCE\nif (competitorIntel.length > 0) {\n  const ciText = competitorIntel.slice(0, 5).map((c, i) =>\n    `${i + 1}. *${safe(c.key_drug || c.drug_name)}* (${safe(c.sponsor)})\\n` +\n    `   Indication: ${safe(c.key_indication)} | Signals: ${safe(c.signal_count)} | ` +\n    `Peak Score: ${safe(c.peak_score, 'N/A')} | Types: ${safe(c.signal_types)}`\n  ).join('\\n\\n');\n\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `🕵️ *7-Day Competitor Radar*\\n\\n${ciText}` }\n  });\n  blocks.push(divider());\n}\n\n// SIGNAL TYPE + SOURCE BREAKDOWN\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `📁 *Signal Types*\\n\\`${safe(d.typeBreakdownStr, 'N/A')}\\`` },\n    { type: 'mrkdwn', text: `🌐 *Top Sources*\\n${safe(d.sourceBreakdownStr, 'N/A')}` }\n  ]\n});\nblocks.push({\n  type: 'section',\n  text: {\n    type: 'mrkdwn',\n    text: `💊 *Most Active Drugs (24h)*: ${safe(d.topDrugs, 'N/A')}`\n  }\n});\nblocks.push(divider());\n\n// FOOTER\nblocks.push({\n  type: 'context',\n  elements: [\n    {\n      type: 'mrkdwn',\n      text:\n        `_OncoWatch Automated CI System | Generated: ${safe(d.now)} | ` +\n        `Updated signals: ${safe(d.updatedCount, '0')} | ` +\n        `LOW suppressed: ${safe(d.lowCount, '0')} | ` +\n        `Scoring Engine v1_`\n    }\n  ]\n});\n\nreturn [{\n  json: {\n    blocks,\n    riskLevel:      d.riskLevel,\n    riskColor,\n    highCount:      d.highCount,\n    total24h:       d.total24h,\n    today:          d.today,\n    execSummary,\n    competitorIntel,\n    heatmap\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        -192
+      ],
+      "id": "4e9caefe-2e52-465a-84d0-02ca717b8d2f",
+      "name": "Build Slack Blocks"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-digest",
+          "mode": "name"
+        },
+        "text": "=📋 *OncoWatch Daily Digest — {{ $('Compute Analytics').first().json.today }}*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{{ $('Compute Analytics').first().json.riskEmoji }} *Risk Level:* {{ $('Compute Analytics').first().json.riskLevel }} — {{ $('Compute Analytics').first().json.riskReason }}\n\n📊 *24h Summary*\n🚨 HIGH: *{{ $('Compute Analytics').first().json.highCount }}*  |  🟡 MED: *{{ $('Compute Analytics').first().json.medCount }}*  |  ⬇️ LOW: *{{ $('Compute Analytics').first().json.lowCount }}*\n🆕 New: *{{ $('Compute Analytics').first().json.newCount }}*  |  🔄 Updated: *{{ $('Compute Analytics').first().json.updatedCount }}*  |  ⚠️ Competitor: *{{ $('Compute Analytics').first().json.competitorCount }}*\n{{ $('Compute Analytics').first().json.trendArrow }} vs Yesterday: *{{ $('Compute Analytics').first().json.trendDelta }} signals ({{ $('Compute Analytics').first().json.trendPct }}%)*  |  ⭐ Avg Score: *{{ $('Compute Analytics').first().json.avgScore }}/10*\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Executive Summary*\n{{ $('AI Executive Summary').first().json.choices[0].message.content }}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{{ $('Build Slack Blocks').first().json.digestBody }}\n",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        1456,
+        -192
+      ],
+      "id": "03f68db8-6742-434f-aa62-af569db0f9f1",
+      "name": "Send a message",
+      "webhookId": "061fbc63-ada8-4f0d-b136-59a35fd2cc12",
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Compute Analytics').first().json;\n\nconst headers = [\n  'date','drug','indication','sponsor','impact_level',\n  'impact_score','signal_type','competitor_flag','signal_status',\n  'version','source','url','ai_summary','recommended_action','first_seen_at'\n].join(',');\n\nconst rows = d.signals24h.map(s => [\n  d.today,\n  `\"${(s.key_drug || s.drug_name || '').replace(/\"/g, '\"\"')}\"`,\n  `\"${(s.key_indication || '').replace(/\"/g, '\"\"')}\"`,\n  `\"${(s.sponsor || '').replace(/\"/g, '\"\"')}\"`,\n  s.impact_level,\n  s.impact_score,\n  s.signal_type,\n  s.competitor_flag ? 'YES' : 'NO',\n  s.signal_status,\n  s.version,\n  s.source,\n  `\"${(s.url || '').replace(/\"/g, '\"\"')}\"`,\n  `\"${(s.ai_summary || '').replace(/\"/g, '\"\"')}\"`,\n  `\"${(s.recommended_action || '').replace(/\"/g, '\"\"')}\"`,\n  s.first_seen_at\n].join(','));\n\nconst csv = [headers, ...rows].join('\\n');\nconst filename = `oncowatch_digest_${d.today}.csv`;\n\nreturn [{ json: { csv, filename, rowCount: rows.length } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        -464
+      ],
+      "id": "575283b1-9576-4456-a57e-ade66d3f8cc5",
+      "name": "Build CSV Export"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO workflow_metrics (\n  total_signals,\n  high_count,\n  med_count,\n  low_count,\n  competitor_count,\n  avg_impact_score\n)\nVALUES (\n  {{ $('Compute Analytics').first().json.total24h }},\n  {{ $('Compute Analytics').first().json.highCount }},\n  {{ $('Compute Analytics').first().json.medCount }},\n  {{ $('Compute Analytics').first().json.lowCount }},\n  {{ $('Compute Analytics').first().json.competitorCount }},\n  {{ $('Compute Analytics').first().json.avgScore }}\n);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        848,
+        96
+      ],
+      "id": "73fe25da-60ca-4fe9-9498-e759c4511871",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -288,
+        16
+      ],
+      "id": "e3968261-dcf2-4bd1-87a8-cbe5ec51dd55",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Compute Analytics').first().json;\n\n// ─── Sanitizer ────────────────────────────────────────────\nconst clean = (v, fallback = 'N/A') => {\n  if (v === null || v === undefined) return fallback;\n  return String(v)\n    .replace(/[\\\\\"]/g, ' ')\n    .replace(/[\\n\\r\\t]/g, ' ')\n    .replace(/[\\u0000-\\u001F\\u007F-\\u009F]/g, '')\n    .replace(/\\s+/g, ' ')\n    .trim() || fallback;\n};\n\n// ─── Signal Intelligence Lines ────────────────────────────\nconst highLines = (d.highSignals || []).slice(0, 5).map((s, i) =>\n  `${i+1}. ${clean(s.key_drug || s.drug_name)} (${clean(s.sponsor)}) ` +\n  `in ${clean(s.key_indication)} via ${clean(s.signal_type)}. ` +\n  `Summary: ${clean(s.ai_summary)}. Recommended action: ${clean(s.recommended_action)}.`\n).join(' || ') || 'No HIGH signals today';\n\nconst medLines = (d.medSignals || []).slice(0, 3).map((s, i) =>\n  `${i+1}. ${clean(s.key_drug || s.drug_name)} (${clean(s.sponsor)}) ` +\n  `in ${clean(s.key_indication)}.`\n).join(' || ') || 'No MED signals today';\n\nconst competitorLines = (d.competitorIntel || []).slice(0, 3).map((c, i) =>\n  `${i+1}. ${clean(c.key_drug || c.drug_name)} by ${clean(c.sponsor)} ` +\n  `targeting ${clean(c.key_indication)} — ${clean(c.signal_count)} signals detected.`\n).join(' || ') || 'No active competitor threats';\n\nconst heatmapLines = (d.heatmap || []).slice(0, 5).map(h =>\n  `${clean(h.indication)}: ${clean(h.total_signals)} signals ` +\n  `(HIGH:${clean(h.high_count)} MED:${clean(h.med_count)} Competitor:${clean(h.competitor_signals)})`\n).join(' | ') || 'No heatmap data';\n\n// ─── System Prompt ────────────────────────────────────────\nconst systemContent =\n  'You are OncoWatch AI, an elite oncology competitive intelligence analyst embedded at Novartis Global Medical Affairs. ' +\n  'Your audience is C-suite: VP Medical Affairs, Senior BD Directors, and Global Oncology Strategy Leads who make million-dollar portfolio decisions daily. ' +\n  'Constraints: Respond in EXACTLY 5 sentences. Zero preamble. Zero filler. ' +\n  'Begin your response directly with the most critical finding. ' +\n  'Every sentence must carry strategic weight. ' +\n  'Style: McKinsey precision meets clinical oncology expertise. ' +\n  'Never speculate — only synthesize the data provided.';\n\n// ─── User Prompt ──────────────────────────────────────────\nconst userContent =\n  `ONCOWATCH DAILY INTELLIGENCE BRIEF - ${clean(d.today)} ` +\n\n  `RISK STATUS: ${clean(d.riskLevel)} - ${clean(d.riskReason)}. ` +\n\n  `24H SIGNAL METRICS: ` +\n  `${clean(d.total24h)} total signals processed. ` +\n  `HIGH impact: ${clean(d.highCount)}. ` +\n  `MED impact: ${clean(d.medCount)}. ` +\n  `LOW impact: ${clean(d.lowCount)}. ` +\n  `New signals: ${clean(d.newCount)}. ` +\n  `Updated signals: ${clean(d.updatedCount)}. ` +\n  `Active competitor hits: ${clean(d.competitorCount)}. ` +\n  `Volume trend vs yesterday: ${clean(d.trendArrow)} ${clean(d.trendDelta)} signals (${clean(d.trendPct)}%). ` +\n  `7-day HIGH signal total: ${clean(d.weekHighCount)}. ` +\n\n  `HIGH IMPACT SIGNALS (requires immediate attention): ${highLines}. ` +\n\n  `MED IMPACT SIGNALS (monitor closely): ${medLines}. ` +\n\n  `ACTIVE COMPETITOR THREATS (7-day radar): ${competitorLines}. ` +\n\n  `THERAPEUTIC INDICATION HEATMAP (24h hotspots): ${heatmapLines}. ` +\n\n  `INTELLIGENCE CONTEXT: ` +\n  `Most active drugs: ${clean(d.topDrugs)}. ` +\n  `Signal type distribution: ${clean(d.typeBreakdownStr)}. ` +\n  `Intelligence sources: ${clean(d.sourceBreakdownStr)}. ` +\n\n  `YOUR TASK - Write exactly 5 sentences in this order: ` +\n  `Sentence 1: State the overall oncology competitive landscape today in one precise sentence including volume and risk level. ` +\n  `Sentence 2: Name the single most urgent competitive threat - identify the exact drug, sponsor, indication, and explain why it is strategically dangerous for Novartis right now. ` +\n  `Sentence 3: Identify which therapeutic indication demands immediate Novartis strategic attention, citing specific signal evidence and clinical rationale. ` +\n  `Sentence 4: Deliver one specific, time-bound, actionable recommendation for the Medical Affairs or BD team to execute within the next 7 days. ` +\n  `Sentence 5: Conclude with the overall risk posture score, and name the single most important signal or development to monitor in the next 48 hours.`;\n\n// ─── Return object directly (no JSON.stringify) ───────────\nreturn [{\n  json: {\n    requestBody: {\n      model: 'google/gemini-2.0-flash-001',\n      messages: [\n        { role: 'system', content: systemContent },\n        { role: 'user',   content: userContent   }\n      ],\n      max_tokens: 450,\n      temperature: 0.15,\n      top_p: 0.8\n    },\n    promptLength: userContent.length,\n    builtAt: new Date().toISOString()\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        -192
+      ],
+      "id": "7a782878-fb94-42a4-95bc-a1ca4517d5d6",
+      "name": "Build AI Prompt"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        1040,
+        -192
+      ],
+      "id": "e6e2ef80-cd05-4cd8-afa3-2aa2d1b5928b",
+      "name": "AI Executive Summary",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7mr2YA0p7FAupMHh",
+          "name": "Openrouter API"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch last 24h signal",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch last 7day signal",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch competitor intel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Indication Heatmap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch competitor intel": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Indication Heatmap": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Fetch last 24h signal": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Fetch last 7day signal": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Compute Analytics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Analytics": {
+      "main": [
+        [
+          {
+            "node": "Build CSV Export",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build AI Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Blocks": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Fetch Indication Heatmap",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch competitor intel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch last 24h signal",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch last 7day signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Executive Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Executive Summary": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Blocks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "d51e0036-122a-48b7-a42f-62ac72edd957",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a8a891a30415836be7de9e961a55fb56810b2ca8a0f8f3007a592ec0e56663ad"
+  },
+  "id": "8a7TDotbH1iLg8vNbGYNL",
+  "tags": []
+}

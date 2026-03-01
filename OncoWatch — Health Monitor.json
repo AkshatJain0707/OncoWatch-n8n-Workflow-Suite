@@ -1,0 +1,756 @@
+{
+  "name": "OncoWatch — Health Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "23cc9b21-3b7a-4e24-93e6-7c8425eecd08",
+      "name": "Schedule Every 6h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1664,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://clinicaltrials.gov/api/v2/studies",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query.cond",
+              "value": "cancer OR oncology OR carcinoma OR lymphoma OR leukemia OR melanoma OR glioblastoma"
+            },
+            {
+              "name": "filter.overallStatus",
+              "value": "RECRUITING,ACTIVE_NOT_RECRUITING,COMPLETED,TERMINATED"
+            },
+            {
+              "name": "sort",
+              "value": "LastUpdatePostDate:desc"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "NCTId,OfficialTitle,OverallStatus,Phase,InterventionName,LeadSponsorName,Condition,StartDate,PrimaryCompletionDate,EnrollmentCount,LastUpdatePostDate"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "c867bf03-2664-4525-9c3e-bc351c93526d",
+      "name": "ClinicalTrials Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1408,
+        -64
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "db",
+              "value": "pubmed"
+            },
+            {
+              "name": "term",
+              "value": "oncology[MeSH] AND (clinical trial[pt] OR phase III[tiab]) AND (2025[pdat] OR 2026[pdat])"
+            },
+            {
+              "name": "retmax",
+              "value": "30"
+            },
+            {
+              "name": "sort",
+              "value": "pub+date"
+            },
+            {
+              "name": "retmode",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "63c42d78-9f7a-4549-8e8e-15217a98ecad",
+      "name": "PubMed Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1408,
+        240
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Helper: clean strings\nfunction cleanStr(v) {\n  if (!v) return '';\n  return String(v).replace(/\\s+/g, ' ').trim();\n}\n\n// Helper: safe array join\nfunction joinArr(arr) {\n  if (!Array.isArray(arr)) return '';\n  return arr.map(a => cleanStr(a)).filter(Boolean).join(', ');\n}\n\n// 1) Normalize ClinicalTrials.gov\nconst ct_raw = [];\ntry {\n  const ct_data = $('ClinicalTrials Agent').first();\n  const studies = ct_data?.json?.studies || [];\n\n  for (const s of studies) {\n    const id       = s.protocolSection?.identificationModule || {};\n    const status   = s.protocolSection?.statusModule || {};\n    const sponsor  = s.protocolSection?.sponsorCollaboratorsModule || {};\n    const design   = s.protocolSection?.designModule || {};\n    const arms     = s.protocolSection?.armsInterventionsModule || {};\n    const conds    = s.protocolSection?.conditionsModule || {};\n\n    const nctId    = cleanStr(id.nctId);\n    const title    = cleanStr(id.officialTitle || id.briefTitle);\n    const phase    = joinArr(design.phases || []);\n    const condStr  = joinArr(conds.conditions || []);\n    const armName  = arms.interventions && arms.interventions[0]\n      ? cleanStr(arms.interventions[0].name)\n      : '';\n\n    // Simple quality scoring (for later prioritization)\n    let quality = 0;\n    if (nctId) quality += 2;\n    if (title) quality += 2;\n    if (phase) quality += 1;\n    if (condStr) quality += 1;\n    if (status.overallStatus) quality += 1;\n\n    ct_raw.push({\n      source_id: nctId,\n      source: 'clinicaltrials',\n      title,\n      sponsor: cleanStr(sponsor.leadSponsor?.name),\n      drug_name: armName,\n      indication: condStr,\n      phase,\n      status: cleanStr(status.overallStatus),\n      url: nctId ? `https://clinicaltrials.gov/study/${nctId}` : '',\n      raw_text: JSON.stringify(s).slice(0, 300), // shorter for Groq\n      signal_origin: 'trial',\n      quality_score: quality\n    });\n  }\n} catch (e) {\n  // optional: console.log('CT normalize error:', e.message);\n}\n\n// 2) Normalize PubMed\nconst pm_raw = [];\ntry {\n  const pm_data = $('PubMed Agent').first();\n  const ids = pm_data?.json?.esearchresult?.idlist || [];\n\n  for (const pmid of ids) {\n    const pmidStr = cleanStr(pmid);\n    if (!pmidStr) continue;\n\n    pm_raw.push({\n      source_id: `pubmed_${pmidStr}`,\n      source: 'pubmed',\n      title: `PubMed Article ${pmidStr}`,\n      sponsor: '',\n      drug_name: '',\n      indication: 'oncology',\n      phase: '',\n      status: '',\n      url: `https://pubmed.ncbi.nlm.nih.gov/${pmidStr}/`,\n      raw_text: `PMID: ${pmidStr}`,\n      signal_origin: 'publication',\n      quality_score: 1\n    });\n  }\n} catch (e) {\n  // optional: console.log('PM normalize error:', e.message);\n}\n\n// 3) Merge, filter, sort by quality, and optionally limit for rate control\nlet all_signals = [...ct_raw, ...pm_raw]\n  .filter(s => !!s.source_id)\n  .sort((a, b) => (b.quality_score || 0) - (a.quality_score || 0));\n\n// TEMP: hard cap per run to protect Groq from rate limits\nconst HARD_CAP = 10;\nall_signals = all_signals.slice(0, HARD_CAP);\n\nreturn all_signals.map(s => ({ json: s }));\n"
+      },
+      "id": "17a7c47f-5509-453b-96c4-b4cf24699656",
+      "name": "Normalize Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1152,
+        96
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function cleanStr(v) {\n  if (!v) return '';\n  return String(v).replace(/\\s+/g, ' ').trim();\n}\n\nfunction computeImpactLevel(baseSignal, ai) {\n  const phase = cleanStr(baseSignal.phase).toUpperCase();\n  const status = cleanStr(baseSignal.status).toUpperCase();\n  const src = cleanStr(baseSignal.source).toLowerCase();\n  const title = cleanStr(baseSignal.title).toLowerCase();\n  const summary = cleanStr(ai.summary || '').toLowerCase();\n  const sigType = cleanStr(ai.signal_type || '').toLowerCase();\n  const competitor = ai.competitor_flag === true;\n\n  let score = 0;\n\n  // --- STRUCTURED FEATURES ---\n\n  // Phase\n  if (phase.includes('PHASE 3') || phase.includes('PHASE3')) score += 4;\n  else if (phase.includes('PHASE 2') || phase.includes('PHASE2')) score += 2;\n  else if (phase.includes('PHASE 1') || phase.includes('PHASE1')) score += 1;\n\n  // Status\n  if (status.includes('COMPLETED')) score += 3;\n  if (status.includes('TERMINATED') || status.includes('SUSPENDED')) score += 4;\n  if (status.includes('RECRUITING') || status.includes('ACTIVE')) score += 1;\n\n  // Source\n  if (src === 'pubmed') score += 1;\n\n  // Competitor flag\n  if (competitor) score += 2;\n\n  // Signal type\n  if (sigType === 'approval') score += 6;\n  if (sigType === 'termination') score += 4;\n  if (sigType === 'safety_signal') score += 5;\n  if (sigType === 'label_expansion') score += 3;\n  if (sigType === 'trial_update') score += 1;\n  if (sigType === 'publication') score += 1;\n  if (sigType === 'pipeline_entry') score += 1;\n\n  // --- TEXTUAL KEYWORDS (title + summary) ---\n\n  const text = `${title} ${summary}`;\n\n  const highKeywords = [\n    'fda approval',\n    'approved',\n    'pivotal',\n    'overall survival',\n    'primary endpoint met',\n    'primary end point met',\n    'breakthrough therapy',\n    'regulatory submission',\n    'submission accepted',\n    'boxed warning',\n    'black box warning',\n    'discontinued due to safety',\n    'dose-limiting toxicity'\n  ];\n\n  const medKeywords = [\n    'phase ii',\n    'phase 2',\n    'randomized',\n    'interim analysis',\n    'objective response rate',\n    'disease-free survival',\n    'progression-free survival',\n    'pfs',\n    'dfs',\n    'os result',\n    'label update',\n    'label change',\n    'key opinion leader',\n    'kol'\n  ];\n\n  const lowKeywords = [\n    'phase i',\n    'phase 1',\n    'first-in-human',\n    'case report',\n    'retrospective',\n    'exploratory'\n  ];\n\n  highKeywords.forEach(k => { if (text.includes(k)) score += 3; });\n  medKeywords.forEach(k => { if (text.includes(k)) score += 1; });\n  lowKeywords.forEach(k => { if (text.includes(k)) score += 0.5; });\n\n  // --- SAFETY & TERMINATION OVERRIDES ---\n\n  if (\n    text.includes('serious adverse event') ||\n    text.includes('dose-limiting toxicity') ||\n    text.includes('unexpected safety') ||\n    status.includes('TERMINATED') ||\n    sigType === 'safety_signal'\n  ) {\n    score += 4;\n  }\n\n  // --- IMPACT BANDING ---\n\n  let impact = 'LOW';\n\n  if (score >= 9) impact = 'HIGH';\n  else if (score >= 4) impact = 'MED';\n  else impact = 'LOW';\n\n  return { impact_level: impact, impact_score: score };\n}\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  try {\n    const raw = item.json.content || item.json.choices?.[0]?.message?.content || '{}';\n\n    let clean = String(raw)\n      .replace(/```json/gi, '')\n      .replace(/```/g, '')\n      .trim();\n\n    const match = clean.match(/\\{[\\s\\S]*\\}/);\n    if (match) clean = match[0];\n\n    const ai = JSON.parse(clean);\n\n    const baseSignal = {\n      source_id: item.json.source_id,\n      source: item.json.source,\n      title: item.json.title,\n      sponsor: item.json.sponsor,\n      drug_name: item.json.drug_name,\n      indication: item.json.indication,\n      phase: item.json.phase,\n      status: item.json.status,\n      url: item.json.url,\n      raw_text: item.json.raw_text,\n      signal_origin: item.json.signal_origin,\n      quality_score: item.json.quality_score\n    };\n\n    const { impact_level, impact_score } = computeImpactLevel(baseSignal, ai);\n\n    out.push({\n      json: {\n        ...baseSignal,\n\n        signal_type: ai.signal_type || 'unknown',\n        impact_level,\n        impact_score,\n        competitor_flag: ai.competitor_flag === true,\n        ai_summary: ai.summary || 'No summary',\n        recommended_action: ai.recommended_action || 'Manual review',\n        key_drug: ai.key_drug || baseSignal.drug_name || '',\n        key_indication: ai.key_indication || baseSignal.indication || '',\n        urgency: ai.urgency || 'monitor',\n        confidence: ai.confidence || 'low',\n        ai_processed: true,\n        parse_error: null\n      }\n    });\n\n  } catch (e) {\n    out.push({\n      json: {\n        source_id: item.json.source_id,\n        source: item.json.source,\n        title: item.json.title,\n        sponsor: item.json.sponsor || '',\n        drug_name: item.json.drug_name || '',\n        indication: item.json.indication || '',\n        phase: item.json.phase || '',\n        status: item.json.status || '',\n        url: item.json.url || '',\n        raw_text: item.json.raw_text || '',\n        signal_origin: item.json.signal_origin,\n        quality_score: item.json.quality_score,\n\n        signal_type: 'unknown',\n        impact_level: 'LOW',\n        impact_score: 0,\n        competitor_flag: false,\n        ai_summary: 'Parse failed — manual review needed',\n        recommended_action: 'Review this signal manually',\n        key_drug: item.json.drug_name || '',\n        key_indication: item.json.indication || 'oncology',\n        urgency: 'monitor',\n        confidence: 'low',\n        ai_processed: false,\n        parse_error: e.message\n      }\n    });\n  }\n}\n\nreturn out;\n\n"
+      },
+      "id": "009a6be1-3e18-4625-8e34-fa34740d6bdc",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -208,
+        -16
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO signals (\n  source_id,\n  source,\n  title,\n  sponsor,\n  drug_name,\n  key_drug,\n  key_indication,\n  impact_level,\n  impact_score,\n  score_breakdown,\n  scoring_version,\n  is_urgent,\n  signal_type,\n  competitor_flag,\n  ai_summary,\n  recommended_action,\n  url,\n  version,\n  first_seen_at,\n  last_seen_at\n)\nVALUES (\n  '{{ $json.source_id }}',\n  '{{ $json.source }}',\n  '{{ ($json.title || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.sponsor || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.drug_name || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.key_drug || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.key_indication || '').replace(/'/g, \"''\") }}',\n  '{{ $json.impact_level || 'LOW' }}',\n  {{ $json.impact_score || 0 }},\n  '{{ $json.score_breakdown || '{}' }}',\n  {{ $json.scoring_version || 1 }},\n  {{ $json.is_urgent || false }},\n  '{{ $json.signal_type || 'unknown' }}',\n  {{ $json.competitor_flag || false }},\n  '{{ ($json.ai_summary || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.recommended_action || '').replace(/'/g, \"''\") }}',\n  '{{ $json.url || '' }}',\n  {{ $json.version || 1 }},\n  NOW(),\n  NOW()\n)\nON CONFLICT (source_id) DO UPDATE SET\n  impact_level       = EXCLUDED.impact_level,\n  impact_score       = EXCLUDED.impact_score,\n  score_breakdown    = EXCLUDED.score_breakdown::jsonb,\n  scoring_version    = EXCLUDED.scoring_version,\n  is_urgent          = EXCLUDED.is_urgent,\n  signal_type        = EXCLUDED.signal_type,\n  competitor_flag    = EXCLUDED.competitor_flag,\n  ai_summary         = EXCLUDED.ai_summary,\n  recommended_action = EXCLUDED.recommended_action,\n  url                = EXCLUDED.url,\n  version            = signals.version + 1,\n  last_seen_at       = NOW();\n",
+        "options": {}
+      },
+      "id": "2144e46b-07bf-4663-a7c4-49e01e5b101a",
+      "name": "Store to Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        256,
+        -16
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "Ud5eplKwWxXzgom9",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-alerts",
+          "mode": "name"
+        },
+        "text": "=🚨 HIGH IMPACT ONCOLOGY SIGNAL (#{{ $json.alert_meta.rank_in_batch }}/{{ $json.alert_meta.batch_size }})\n\nDrug: {{ $json.key_drug }}\nIndication: {{ $json.key_indication }}\nSponsor: {{ $json.sponsor }}\nType: {{ $json.signal_type }}\nImpact: {{ $json.impact_level }} (score {{ $json.impact_score }})\n\nSummary: {{ $json.ai_summary }}\nAction: {{ $json.recommended_action }}\n\nSource: {{ $json.source }} | {{ $json.url }}\nRouted at: {{ $json.alert_meta.routed_at }}\n",
+        "otherOptions": {}
+      },
+      "id": "7c79ca48-77e9-448a-99be-7968080228ad",
+      "name": "Slack HIGH Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        752,
+        -112
+      ],
+      "webhookId": "c41c22a5-afbc-4af2-be59-2df6e9026038",
+      "retryOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -944,
+        96
+      ],
+      "id": "0d965668-7f74-46db-b474-cafc7d04c824",
+      "name": "Wait",
+      "webhookId": "80857c58-3728-4111-96b4-bfaaedc595e7"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -720,
+        -192
+      ],
+      "id": "1a3616f3-ed64-4cf1-9f0e-0cb805f8c2ad",
+      "name": "Merge",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -512,
+        -192
+      ],
+      "id": "f3e2e359-8f72-4030-a9a8-47a6c4e6fe8b",
+      "name": "Wait1",
+      "webhookId": "7057b269-cac4-4c26-9a4b-8920f3e7473a",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"openai/gpt-4o-mini\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 220,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior oncology competitive intelligence analyst at a top-10 pharmaceutical company. You ALWAYS reply with a single valid JSON object only (no markdown, no prose outside JSON).\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Analyze this oncology signal and output structured CI.\\n\\nSIGNAL DATA:\\nTitle: {{ $json.title }}\\nSponsor: {{ $json.sponsor }}\\nDrug: {{ $json.drug_name }}\\nIndication: {{ $json.indication }}\\nPhase: {{ $json.phase }}\\nStatus: {{ $json.status }}\\nSource: {{ $json.source }}\\n\\nReturn ONLY a JSON object with exactly these keys and allowed values:\\n{\\n  \\\"signal_type\\\": \\\"trial_update\\\" | \\\"approval\\\" | \\\"publication\\\" | \\\"termination\\\" | \\\"pipeline_entry\\\" | \\\"label_expansion\\\" | \\\"safety_signal\\\",\\n  \\\"impact_level\\\": \\\"HIGH\\\" | \\\"MED\\\" | \\\"LOW\\\",\\n  \\\"competitor_flag\\\": true | false,\\n  \\\"summary\\\": \\\"2 short sentences of strategic insight for a pharma brand team\\\",\\n  \\\"recommended_action\\\": \\\"1 concrete next step for the medical affairs team\\\",\\n  \\\"key_drug\\\": \\\"primary drug name (or Drug not specified)\\\",\\n  \\\"key_indication\\\": \\\"primary oncology indication (or Indication not specified)\\\",\\n  \\\"urgency\\\": \\\"immediate\\\" | \\\"this_week\\\" | \\\"this_month\\\" | \\\"monitor\\\",\\n  \\\"confidence\\\": \\\"high\\\" | \\\"medium\\\" | \\\"low\\\"\\n}\\n\\nIMPACT GUIDE (use exactly these labels):\\n- HIGH: FDA approval, Phase 3 completion/result, major competitor milestone, important safety signal.\\n- MED: Phase 2 result, new trial enrollment, label change, important KOL publication.\\n- LOW: Phase 1/early pipeline, generic publications, low-impact updates.\\n\"\n    }\n  ]\n}\n",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a56524e6-6e16-490b-8d5e-07e364488419",
+      "name": "AI Classifier 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -592,
+        224
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "7mr2YA0p7FAupMHh",
+          "name": "Openrouter API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama-3.3-70b-versatile\",\n  \"temperature\": 0.4,\n  \"max_tokens\": 256,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior oncology competitive intelligence analyst at a top-10 pharmaceutical company. Always respond with valid JSON only — no markdown, no extra text.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Analyze this oncology signal and return structured JSON intelligence.\\n\\nSIGNAL DATA:\\nTitle: {{ $json.title }}\\nSponsor: {{ $json.sponsor }}\\nDrug: {{ $json.drug_name }}\\nIndication: {{ $json.indication }}\\nPhase: {{ $json.phase }}\\nStatus: {{ $json.status }}\\nSource: {{ $json.source }}\\n\\nReturn ONLY this JSON:\\n{\\n  \\\"signal_type\\\": \\\"trial_update or approval or publication or termination or pipeline_entry or label_expansion or safety_signal\\\",\\n  \\\"impact_level\\\": \\\"HIGH or MED or LOW\\\",\\n  \\\"competitor_flag\\\": true or false,\\n  \\\"summary\\\": \\\"Two sentence strategic insight for a pharma brand team\\\",\\n  \\\"recommended_action\\\": \\\"One specific next step for the medical affairs team\\\",\\n  \\\"key_drug\\\": \\\"primary drug name\\\",\\n  \\\"key_indication\\\": \\\"primary oncology indication\\\",\\n  \\\"urgency\\\": \\\"immediate or this_week or this_month or monitor\\\",\\n  \\\"confidence\\\": \\\"high or medium or low\\\"\\n}\\n\\nIMPACT GUIDE:\\nHIGH = FDA approval, Phase 3 completion, major competitor milestone, safety signal\\nMED = Phase 2 results, new trial enrollment, label change, KOL publication\\nLOW = Phase 1 updates, early pipeline, general publications\"\n    }\n  ]\n}\n",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "08592060-2b47-4785-9ca0-e48f90ef552e",
+      "name": "AI Classifier 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -464,
+        -16
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "X2PWrnfY3oPrwSE9",
+          "name": "Groq API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-alerts",
+          "mode": "name"
+        },
+        "text": "=🟡 MED IMPACT ONCOLOGY SIGNAL (#{{ $json.alert_meta.rank_in_batch }}/{{ $json.alert_meta.batch_size }})\n\nDrug: {{ $json.key_drug }}\nIndication: {{ $json.key_indication }}\nSponsor: {{ $json.sponsor }}\nType: {{ $json.signal_type }}\nImpact: {{ $json.impact_level }} (score {{ $json.impact_score }})\n\nSummary: {{ $json.ai_summary }}\nAction: {{ $json.recommended_action }}\n\nSource: {{ $json.source }} | {{ $json.url }}\nRouted at: {{ $json.alert_meta.routed_at }}\n",
+        "otherOptions": {}
+      },
+      "id": "2db042f6-bed9-474c-bbaa-4f4907836f2b",
+      "name": "Slack MED Alert1",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        752,
+        80
+      ],
+      "webhookId": "c41c22a5-afbc-4af2-be59-2df6e9026038",
+      "retryOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Configuration\nconst CONFIG = {\n  // which impact levels to route\n  enabledLevels: ['HIGH', 'MED', 'LOW'],\n  // maximum alerts per level per run (0 = no limit)\n  maxPerLevel: {\n    HIGH: 10,\n    MED: 20,\n    LOW: 20,\n  },\n  // minimum impact_score to send (per level), if present\n  minScore: {\n    HIGH: 0,\n    MED: 0,\n    LOW: 0,\n  }\n};\n\nfunction normImpact(v) {\n  if (!v && v !== 0) return 'LOW';\n  return String(v).toUpperCase().replace(/^=+/, '').trim();\n}\n\nfunction getScore(item) {\n  const s = item.json?.impact_score;\n  const n = Number(s);\n  return Number.isFinite(n) ? n : 0;\n}\n\nconst buckets = {\n  HIGH: [],\n  MED: [],\n  LOW: [],\n};\n\n// 1) Bucket items by normalized impact level\nfor (const item of $input.all()) {\n  const impact = normImpact(item.json.impact_level);\n  const score = getScore(item);\n\n  // Default unknown impacts to LOW\n  let level = 'LOW';\n  if (impact === 'HIGH') level = 'HIGH';\n  else if (impact === 'MED') level = 'MED';\n\n  // Filter by enabledLevels\n  if (!CONFIG.enabledLevels.includes(level)) continue;\n\n  // Filter by minScore per level\n  if (score < (CONFIG.minScore[level] || 0)) continue;\n\n  buckets[level].push({ item, score });\n}\n\n// 2) Sort each bucket by score (desc) and apply maxPerLevel\nconst routed = {};\nfor (const level of ['HIGH', 'MED', 'LOW']) {\n  let arr = buckets[level];\n\n  // sort: highest score first\n  arr.sort((a, b) => b.score - a.score);\n\n  const maxN = CONFIG.maxPerLevel[level] || 0;\n  if (maxN > 0) {\n    arr = arr.slice(0, maxN);\n  }\n\n  routed[level] = arr.map(({ item }) => item.json);\n}\n\n// 3) Build a single routing summary object\nconst result = {\n  high_signals: routed.HIGH,\n  med_signals: routed.MED,\n  low_signals: routed.LOW,\n  stats: {\n    total_input: $input.all().length,\n    total_high: routed.HIGH.length,\n    total_med: routed.MED.length,\n    total_low: routed.LOW.length,\n    timestamp: new Date().toISOString(),\n  }\n};\n\nreturn [{ json: result }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        256
+      ],
+      "id": "cbcaecaa-c754-4f1e-84a5-d042836e6b1c",
+      "name": "Route by Impact",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config for HIGH alerts\nconst CONFIG = {\n  maxHighPerRun: 10,         // hard cap per execution (0 = no cap)\n  sortByScoreDesc: true,     // use impact_score if available\n  dedupBySourceId: true      // avoid duplicate source_id in this batch\n};\n\nfunction getScore(obj) {\n  const n = Number(obj.impact_score);\n  return Number.isFinite(n) ? n : 0;\n}\n\nconst input = $input.first().json;\nlet highs = Array.isArray(input.high_signals) ? input.high_signals : [];\n\n// 1) Optional dedup by source_id\nif (CONFIG.dedupBySourceId) {\n  const seen = new Set();\n  highs = highs.filter(h => {\n    const id = h.source_id || '';\n    if (!id) return true;\n    if (seen.has(id)) return false;\n    seen.add(id);\n    return true;\n  });\n}\n\n// 2) Sort by impact_score desc if configured\nif (CONFIG.sortByScoreDesc) {\n  highs.sort((a, b) => getScore(b) - getScore(a));\n}\n\n// 3) Apply max per run\nif (CONFIG.maxHighPerRun > 0) {\n  highs = highs.slice(0, CONFIG.maxHighPerRun);\n}\n\n// 4) Add alert metadata to each item\nconst now = new Date().toISOString();\nconst out = highs.map((h, index) => ({\n  json: {\n    ...h,\n    alert_meta: {\n      level: 'HIGH',\n      rank_in_batch: index + 1,\n      batch_size: highs.length,\n      routed_at: now\n    }\n  }\n}));\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        256
+      ],
+      "id": "d67d906b-1e2f-4541-a2d8-1e217a2369e4",
+      "name": "Fan-out HIGH",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config for MED alerts\nconst CONFIG = {\n  maxMedPerRun: 20,          // hard cap per execution (0 = no cap)\n  sortByScoreDesc: true,\n  dedupBySourceId: true\n};\n\nfunction getScore(obj) {\n  const n = Number(obj.impact_score);\n  return Number.isFinite(n) ? n : 0;\n}\n\nconst input = $input.first().json;\nlet meds = Array.isArray(input.med_signals) ? input.med_signals : [];\n\n// 1) Optional dedup by source_id\nif (CONFIG.dedupBySourceId) {\n  const seen = new Set();\n  meds = meds.filter(m => {\n    const id = m.source_id || '';\n    if (!id) return true;\n    if (seen.has(id)) return false;\n    seen.add(id);\n    return true;\n  });\n}\n\n// 2) Sort by impact_score desc if configured\nif (CONFIG.sortByScoreDesc) {\n  meds.sort((a, b) => getScore(b) - getScore(a));\n}\n\n// 3) Apply max per run\nif (CONFIG.maxMedPerRun > 0) {\n  meds = meds.slice(0, CONFIG.maxMedPerRun);\n}\n\n// 4) Add alert metadata\nconst now = new Date().toISOString();\nconst out = meds.map((m, index) => ({\n  json: {\n    ...m,\n    alert_meta: {\n      level: 'MED',\n      rank_in_batch: index + 1,\n      batch_size: meds.length,\n      routed_at: now\n    }\n  }\n}));\n\nreturn out;\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        416
+      ],
+      "id": "39669296-b103-465e-8d1a-db46b1555869",
+      "name": "Fan-out MED",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config for LOW alerts\nconst CONFIG = {\n  maxLowPerRun: 20,          // hard cap per execution (0 = no cap)\n  sortByScoreDesc: true,\n  dedupBySourceId: true\n};\n\nfunction getScore(obj) {\n  const n = Number(obj.impact_score);\n  return Number.isFinite(n) ? n : 0;\n}\n\nconst input = $input.first().json;\nlet lows = Array.isArray(input.low_signals) ? input.low_signals : [];\n\n// 1) Optional dedup by source_id\nif (CONFIG.dedupBySourceId) {\n  const seen = new Set();\n  lows = lows.filter(l => {\n    const id = l.source_id || '';\n    if (!id) return true;\n    if (seen.has(id)) return false;\n    seen.add(id);\n    return true;\n  });\n}\n\n// 2) Sort by impact_score desc if configured\nif (CONFIG.sortByScoreDesc) {\n  lows.sort((a, b) => getScore(b) - getScore(a));\n}\n\n// 3) Apply max per run\nif (CONFIG.maxLowPerRun > 0) {\n  lows = lows.slice(0, CONFIG.maxLowPerRun);\n}\n\n// 4) Add alert metadata\nconst now = new Date().toISOString();\nconst out = lows.map((l, index) => ({\n  json: {\n    ...l,\n    alert_meta: {\n      level: 'LOW',\n      rank_in_batch: index + 1,\n      batch_size: lows.length,\n      routed_at: now\n    }\n  }\n}));\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        592
+      ],
+      "id": "31d85ef8-028b-45d0-aafc-959c9fcd2f6a",
+      "name": "Fan-out LOW",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#oncowatch-alerts",
+          "mode": "name"
+        },
+        "text": "=🟢 LOW IMPACT ONCOLOGY SIGNAL (#{{ $json.alert_meta.rank_in_batch }}/{{ $json.alert_meta.batch_size }})\n\nDrug: {{ $json.key_drug }}\nIndication: {{ $json.key_indication }}\nSponsor: {{ $json.sponsor }}\nType: {{ $json.signal_type }}\nImpact: {{ $json.impact_level }} (score {{ $json.impact_score }})\n\nSummary: {{ $json.ai_summary }}\n\nSource: {{ $json.source }} | {{ $json.url }}\nRouted at: {{ $json.alert_meta.routed_at }}\n",
+        "otherOptions": {}
+      },
+      "id": "f2277ccd-9fb5-40ae-becc-9eb8d86c7e45",
+      "name": "Slack LOW Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        544,
+        288
+      ],
+      "webhookId": "c41c22a5-afbc-4af2-be59-2df6e9026038",
+      "retryOnFail": true,
+      "credentials": {
+        "slackApi": {
+          "id": "TGdTBIhW9Qjl2kXr",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        960,
+        -112
+      ],
+      "id": "e2bd8c64-7343-475e-bbd0-65e406109d5a",
+      "name": "All Alerts done"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check execution mode: 'test' when you click Execute, 'production' when auto-run [web:7][web:4]\nconst mode = $execution.mode;  // or $execution.mode in expression view\n\n// We only want to trigger digest on MANUAL / TEST runs.\nconst shouldTrigger = mode === 'test';\n\n// Expose flag to next node\nreturn [\n  {\n    json: {\n      shouldTrigger,\n      mode\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        -112
+      ],
+      "id": "4a724f95-0e75-4466-b52b-1b98c6196642",
+      "name": "Maybe Trigger Digest"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "8a7TDotbH1iLg8vNbGYNL",
+          "mode": "id",
+          "cachedResultUrl": "/workflow/8a7TDotbH1iLg8vNbGYNL"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        1376,
+        -112
+      ],
+      "id": "b77ff4c8-0b79-4064-b58b-3387603a34dd",
+      "name": "Call 'Oncowatch_Daily_Digest'",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\n// ─── SCORING WEIGHTS v1.0 ─────────────────────────────────\nconst WEIGHTS = {\n  // Base impact level scores\n  baseScore: {\n    HIGH: 6.0,\n    MED:  3.5,\n    LOW:  1.0,\n    UNKNOWN: 0.5\n  },\n\n  // Signal type weights\n  signalType: {\n    'fda_approval'       : 2.0,\n    'approval'           : 2.0,\n    'regulatory'         : 1.8,\n    'safety_update'      : 1.7,\n    'trial_result'       : 1.5,\n    'phase3_result'      : 1.8,\n    'phase2_result'      : 1.3,\n    'phase1_result'      : 0.8,\n    'trial_update'       : 0.8,\n    'publication'        : 0.7,\n    'press_release'      : 0.5,\n    'conference'         : 0.5,\n    'acquisition'        : 1.2,\n    'merger'             : 1.2,\n    'partnership'        : 0.6,\n    'patent'             : 0.4,\n    'ipo'                : 0.6,\n    'funding'            : 0.5,\n    'label_update'       : 1.5,\n    'breakthrough_designation': 1.8,\n    'fast_track'         : 1.3,\n    'orphan_designation' : 0.8,\n    'trial_initiation'   : 0.6,\n    'biomarker'          : 0.9,\n    'combo_therapy'      : 1.1\n  },\n\n  // Competitor bonus\n  competitor: 2.5,\n\n  // Source credibility weights\n  source: {\n    'clinicaltrials'     : 1.0,\n    'fda'                : 1.2,\n    'ema'                : 1.1,\n    'pubmed'             : 0.9,\n    'sec'                : 0.8,\n    'press'              : 0.6,\n    'twitter'            : 0.4,\n    'news'               : 0.5,\n    'company_website'    : 0.7,\n    'conference'         : 0.8\n  },\n\n  // Version activity bonus\n  version: {\n    v2:    0.3,\n    v3:    0.5,\n    v4plus: 0.8\n  },\n\n  // Recency bonus (hours since first_seen)\n  recency: {\n    within6h:  1.0,\n    within24h: 0.5,\n    within48h: 0.2,\n    older:     0.0\n  },\n\n  // Indication strategic importance for Novartis oncology\n  indication: {\n    'non-small cell lung carcinoma'    : 1.5,\n    'nsclc'                            : 1.5,\n    'breast carcinoma'                 : 1.3,\n    'triple-negative breast carcinoma' : 1.5,\n    'tnbc'                             : 1.5,\n    'colorectal carcinoma'             : 1.2,\n    'melanoma'                         : 1.2,\n    'renal cell carcinoma'             : 1.1,\n    'clear cell renal carcinoma'       : 1.2,\n    'hepatocellular carcinoma'         : 1.1,\n    'ovarian carcinoma'                : 1.2,\n    'bladder carcinoma'                : 1.0,\n    'prostate carcinoma'               : 1.1,\n    'leukemia'                         : 1.2,\n    'lymphoma'                         : 1.1,\n    'multiple myeloma'                 : 1.2,\n    'glioblastoma'                     : 1.3,\n    'pancreatic carcinoma'             : 1.2,\n    'gastric carcinoma'                : 1.0,\n    'cervical carcinoma'               : 1.0\n  },\n\n  // Maximum possible score cap\n  MAX_SCORE: 10.0\n};\n\n// ─── HELPER FUNCTIONS ─────────────────────────────────────\n\nfunction getBaseScore(impact_level) {\n  const level = String(impact_level || '').toUpperCase();\n  return WEIGHTS.baseScore[level] || WEIGHTS.baseScore.UNKNOWN;\n}\n\nfunction getSignalTypeBonus(signal_type) {\n  const type = String(signal_type || '').toLowerCase().replace(/[\\s-]/g, '_');\n  return WEIGHTS.signalType[type] || 0;\n}\n\nfunction getCompetitorBonus(competitor_flag) {\n  return (competitor_flag === true || competitor_flag === 'true') ? WEIGHTS.competitor : 0;\n}\n\nfunction getSourceBonus(source) {\n  const src = String(source || '').toLowerCase().trim();\n  for (const [key, val] of Object.entries(WEIGHTS.source)) {\n    if (src.includes(key)) return val;\n  }\n  return 0.5;\n}\n\nfunction getVersionBonus(version) {\n  const v = parseInt(version || 1, 10);\n  if (v >= 4)      return WEIGHTS.version.v4plus;\n  else if (v === 3) return WEIGHTS.version.v3;\n  else if (v === 2) return WEIGHTS.version.v2;\n  return 0;\n}\n\nfunction getRecencyBonus(first_seen_at) {\n  try {\n    const hoursAgo = (Date.now() - new Date(first_seen_at).getTime()) / 3600000;\n    if (hoursAgo <= 6)  return WEIGHTS.recency.within6h;\n    if (hoursAgo <= 24) return WEIGHTS.recency.within24h;\n    if (hoursAgo <= 48) return WEIGHTS.recency.within48h;\n    return WEIGHTS.recency.older;\n  } catch(e) {\n    return 0;\n  }\n}\n\nfunction getIndicationBonus(key_indication) {\n  const ind = String(key_indication || '').toLowerCase().trim();\n  for (const [key, val] of Object.entries(WEIGHTS.indication)) {\n    if (ind.includes(key)) return val;\n  }\n  return 0;\n}\n\nfunction getUrgencyFlag(level, competitor, signalType, score) {\n  const type = String(signalType || '').toLowerCase();\n  const isCriticalType = [\n    'fda_approval', 'approval', 'safety_update',\n    'regulatory', 'label_update', 'breakthrough_designation'\n  ].some(t => type.includes(t));\n\n  return (\n    (level === 'HIGH' && competitor) ||\n    (score >= 8.5) ||\n    (level === 'HIGH' && isCriticalType) ||\n    (competitor && isCriticalType)\n  );\n}\n\n// ─── MAIN SCORING LOOP ────────────────────────────────────\nreturn items.map(item => {\n  const s = { ...item.json };\n\n  const level       = String(s.impact_level || '').toUpperCase();\n  const isCompetitor = s.competitor_flag === true || String(s.competitor_flag) === 'true';\n\n  // Calculate each component\n  const baseScore        = getBaseScore(s.impact_level);\n  const signalTypeBonus  = getSignalTypeBonus(s.signal_type);\n  const competitorBonus  = getCompetitorBonus(s.competitor_flag);\n  const sourceBonus      = getSourceBonus(s.source);\n  const versionBonus     = getVersionBonus(s.version);\n  const recencyBonus     = getRecencyBonus(s.first_seen_at);\n  const indicationBonus  = getIndicationBonus(s.key_indication);\n\n  // Raw score\n  const rawScore = (\n    baseScore +\n    signalTypeBonus +\n    competitorBonus +\n    sourceBonus +\n    versionBonus +\n    recencyBonus +\n    indicationBonus\n  );\n\n  // Cap at MAX_SCORE\n  const finalScore = Math.min(\n    parseFloat(rawScore.toFixed(2)),\n    WEIGHTS.MAX_SCORE\n  );\n\n  // Urgency flag\n  const isUrgent = getUrgencyFlag(level, isCompetitor, s.signal_type, finalScore);\n\n  // Full breakdown for audit trail\n  const scoreBreakdown = {\n    base:        baseScore,\n    signalType:  signalTypeBonus,\n    competitor:  competitorBonus,\n    source:      sourceBonus,\n    version:     versionBonus,\n    recency:     recencyBonus,\n    indication:  indicationBonus,\n    raw:         parseFloat(rawScore.toFixed(2)),\n    final:       finalScore,\n    scoringVersion: 1\n  };\n\n  return {\n    json: {\n      ...s,\n      impact_score:     finalScore,\n      is_urgent:        isUrgent,\n      score_breakdown:  JSON.stringify(scoreBreakdown),\n      scoring_version:  1\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        -16
+      ],
+      "id": "1e655c9f-37ea-4fc9-b1ef-37897b795c3b",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Every 6h": {
+      "main": [
+        [
+          {
+            "node": "ClinicalTrials Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PubMed Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ClinicalTrials Agent": {
+      "main": [
+        [
+          {
+            "node": "Normalize Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Signals": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          },
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Store to Postgres",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store to Postgres": {
+      "main": [
+        []
+      ]
+    },
+    "PubMed Agent": {
+      "main": [
+        [
+          {
+            "node": "Normalize Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "AI Classifier 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Classifier 1": {
+      "main": [
+        []
+      ]
+    },
+    "AI Classifier 2": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Impact": {
+      "main": [
+        [
+          {
+            "node": "Fan-out HIGH",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fan-out MED",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fan-out LOW",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan-out HIGH": {
+      "main": [
+        [
+          {
+            "node": "Slack HIGH Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan-out MED": {
+      "main": [
+        [
+          {
+            "node": "Slack MED Alert1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan-out LOW": {
+      "main": [
+        [
+          {
+            "node": "Slack LOW Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack HIGH Alert": {
+      "main": [
+        [
+          {
+            "node": "All Alerts done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack MED Alert1": {
+      "main": [
+        [
+          {
+            "node": "All Alerts done",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Slack LOW Alert": {
+      "main": [
+        [
+          {
+            "node": "All Alerts done",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "All Alerts done": {
+      "main": [
+        [
+          {
+            "node": "Maybe Trigger Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Maybe Trigger Digest": {
+      "main": [
+        [
+          {
+            "node": "Call 'Oncowatch_Daily_Digest'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Route by Impact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "u6wXIEA7ztp5OTXi2YqW2"
+  },
+  "versionId": "627ec3ac-cb6b-4f5c-8a63-ba880312d70c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a8a891a30415836be7de9e961a55fb56810b2ca8a0f8f3007a592ec0e56663ad"
+  },
+  "id": "iP4VzYw_d_b-Go-dJSOQU",
+  "tags": [
+    {
+      "updatedAt": "2026-02-27T18:50:22.568Z",
+      "createdAt": "2026-02-27T18:50:22.568Z",
+      "id": "AaXz4Vh6HeAVcrUL",
+      "name": "OncoWatch"
+    }
+  ]
+}
